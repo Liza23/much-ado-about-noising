@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH -p general
+#SBATCH --job-name=vla-task-render
+#SBATCH --gres=gpu:1
+#SBATCH -c 16
+#SBATCH --mem=32G
+#SBATCH -t 24:00:00
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+
+# --- setup ---
+mkdir -p logs
+hostname
+date
+nvidia-smi -L
+
+# --- env ---
+source ~/.bashrc
+export UV_PROJECT_ENVIRONMENT=.venv
+
+# --- sanity ---
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+uv run python - << 'EOF'
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("Num GPUs:", torch.cuda.device_count())
+EOF
+
+# --- launch ---
+cd /home/ldahiya/max_vla/much-ado-about-noising
+
+# VLA with rendering: current + future image cross-attention
+# Single GPU (renderer env stepping is the bottleneck, not compute)
+uv run python examples/train_pusht.py \
+    task=pusht_vla_crossattn \
+    network=vla_crossattn \
+    optimization.auto_resume=false \
+    optimization.batch_size=32 \
+    optimization.gradient_steps=500000 \
+    log.log_dir="/data/user_data/ldahiya/0213_pusht_max_vla_corrected/task_render/" \
+    log.project="0213_max_vla_pusht" \
+    log.exp_name="vla-task-render"

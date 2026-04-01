@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - square_ph_state
+  - _self_
+
+intent_conditioning: true
+intent_dim: 7        # eef_pos (3) + eef_quat (4) — indices [14:21]
+intent_horizon: 8
+intent_predictor: true
+intent_training_mode: joint
+intent_type: cv_proxy

@@ -1,0 +1,18 @@
+# @package task
+defaults:
+  - square_ph_state
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent — square-ph task.
+#
+# Square requires significantly more rotation than lift, making the
+# quaternion-mean problem acute.  Encoded-mean should help most here.
+#
+# See lift_ph_state_hierarchical_emb.yaml for full design notes.
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4)
+intent_emb_dim: 64
+intent_type: encoded_mean
+intent_predictor: true    # required for encoded_mean
+intent_horizon: 8
+intent_training_mode: joint

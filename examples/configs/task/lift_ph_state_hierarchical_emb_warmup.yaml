@@ -1,0 +1,24 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent + encoder warmup.
+#
+# Same as lift_ph_state_hierarchical_emb.yaml but IntentEncoder is frozen
+# after intent_encoder_warmup_steps=50000 steps.
+#
+# Rationale: IntentPredictor is trained to predict encoder outputs. If the encoder
+# keeps shifting, the predictor is chasing a moving target. Freezing after warmup
+# lets the predictor converge to a fixed embedding space.
+#
+# Compare against:
+#   lift_ph_state_hierarchical_emb.yaml  — Config B with encoded_mean (no freeze)
+#   lift_ph_state_flow_intent_emb_warmup.yaml — Config A with encoded_mean + freeze
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4); used for dataset extraction
+intent_type: cv_proxy
+intent_predictor: true    # required: CV proxy has no meaning in embedding space
+intent_horizon: 8
+intent_training_mode: joint
+intent_encoder_warmup_steps: 50000  # freeze IntentEncoder after 50k steps

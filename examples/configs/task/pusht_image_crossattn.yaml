@@ -1,0 +1,9 @@
+# @package task
+# PushT image observations with cross-attention renderer
+defaults:
+  - pusht_image  # Inherit from pusht_image which has shape_meta
+  - _self_
+
+# Image renderer settings
+use_image_renderer: true  # Use image renderer (steps env and renders future state)
+env_type: "gym"  # Use gym instead of ph

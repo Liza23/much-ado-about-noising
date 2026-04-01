@@ -1,0 +1,10 @@
+# @package task
+defaults:
+  - can_ph_state
+  - _self_
+
+intent_conditioning: true
+intent_dim: 7
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: independent

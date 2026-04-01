@@ -1,0 +1,12 @@
+# @package task
+# PushT image with agent-only rendering (no physics step)
+# The rendered image shows the agent at the predicted action position
+# while keeping the T-block and environment unchanged.
+defaults:
+  - pusht_image
+  - _self_
+
+# Agent-only renderer: teleports agent to action position, no physics
+use_image_renderer: true
+renderer_type: "agent_only"
+env_type: "gym"

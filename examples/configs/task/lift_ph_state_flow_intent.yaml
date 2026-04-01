@@ -1,0 +1,29 @@
+# @package task
+# Config A: flow-based intent model + deterministic MLP action decoder
+#
+# Architecture:
+#   - Shared context encoder  (same MLP encoder as Config B)
+#   - Flow intent model       (FlowMap in intent space; Ta=1, D=intent_dim)
+#   - MLP action decoder      (deterministic; (obs_emb, intent) → action)
+#
+# Switch: network.arch_variant=flow_intent  (set in the companion network yaml or
+#         via CLI override: network.arch_variant=flow_intent)
+#
+# Dataset: requires intent_conditioning=true so the dataset provides GT intent
+#          (mean future eef pos+quat) for training both sub-models.
+#
+# Contrast with Config B variants:
+#   lift_ph_state_hierarchical.yaml  — MLP intent predictor (joint)
+#   lift_ph_state_intent_learned.yaml — MLP intent predictor (independent)
+#   this file                        — Flow intent model + MLP action decoder
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Intent settings — same as other intent variants (7D mean eef pos+quat)
+intent_conditioning: true
+intent_dim: 7         # eef_pos (3) + eef_quat (4)
+intent_horizon: 8     # mean over next 8 steps
+intent_predictor: false  # no standalone MLP predictor; intent is a flow model
+intent_training_mode: independent  # action decoder uses GT intent (no joint coupling needed)
+intent_type: mean

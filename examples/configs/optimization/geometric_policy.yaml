@@ -1,0 +1,16 @@
+# @package optimization
+# Optimization config for geometric policy
+defaults:
+  - default
+  - _self_
+
+# Use regression loss (not flow matching)
+loss_type: "flow"
+
+# Smaller batch size for v0 (sim renderer is slow)
+batch_size: 16
+
+# Standard settings
+lr: 1e-4
+weight_decay: 1e-6
+gradient_steps: 100000

@@ -1,0 +1,27 @@
+# @package network
+# VLA-style network with CLIP vision encoder and cross-attention decoder
+defaults:
+  - _base
+  - _self_
+
+network_type: "vla_crossattn_policy"
+
+# CLIP Vision Encoder
+clip_model: "openai/clip-vit-base-patch16"  # ViT-B/16
+freeze_vision: true  # Freeze CLIP weights (finetune later if needed)
+image_size: 224  # CLIP input size
+
+# Transformer Decoder
+emb_dim: 768  # CLIP ViT-B embedding dimension
+num_layers: 6  # Transformer decoder layers
+n_heads: 8  # Attention heads
+dropout: 0.1
+
+# Language (optional, disabled for now)
+use_language: false
+
+# State in decoder (set false to only use state in draft head, not decoder cross-attention)
+use_state_in_decoder: true
+
+# Encoder type (identity since CLIP is built-in)
+encoder_type: "identity"

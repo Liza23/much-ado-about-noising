@@ -1,0 +1,23 @@
+# @package network
+# Config A variant: MLP intent flow model + ChiUNet action flow model.
+#
+# Stage 1 (intent): standard MLP FlowMap with horizon=1, identical to mlp_flow_intent.
+# Stage 2 (action): ChiUNet FlowMap with horizon=task.horizon, conditioned on
+#                   obs_emb ⊕ intent → (B, To, emb_dim + intent_dim).
+#
+# The MLP backbone params (emb_dim, num_layers, dropout) govern the intent flow model
+# and the shared encoder.  The ChiUNet params below govern the action flow model.
+defaults:
+  - mlp_flow_intent   # inherits arch_variant=flow_intent, emb_dim=512, etc.
+  - _self_
+
+# Override arch_variant to activate ChiUNet action path in FlowIntentAgent.
+arch_variant: "flow_intent_chiunet"
+
+# ChiUNet action model params (same defaults as chiunet.yaml)
+model_dim: 128
+kernel_size: 5
+cond_predict_scale: true
+obs_as_global_cond: true     # intent ⊕ obs_emb passed as global cond → linear → emb_dim
+dim_mult: [1, 2, 2]
+timestep_emb_type: "positional"

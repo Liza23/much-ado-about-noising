@@ -1,0 +1,12 @@
+# @package task
+# PushT with VLA-style CLIP + cross-attention
+defaults:
+  - pusht_image  # Inherit image obs settings
+  - _self_
+
+# VLA renderer settings
+use_image_renderer: true
+env_type: "gym"
+
+# CLIP expects 224x224 images
+render_size: 224

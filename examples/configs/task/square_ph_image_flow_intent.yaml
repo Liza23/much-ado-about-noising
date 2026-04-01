@@ -1,0 +1,14 @@
+# @package task
+defaults:
+  - square_ph_image
+  - _self_
+
+# Config A (flow intent) — square-ph image observations, raw 7D intent.
+#
+# Same as lift_ph_image_flow_intent but for the harder square task.
+intent_conditioning: true
+intent_dim: 7
+intent_type: mean
+intent_predictor: false
+intent_horizon: 8
+intent_training_mode: independent

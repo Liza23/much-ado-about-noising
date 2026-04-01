@@ -1,0 +1,10 @@
+# @package network
+# Config A network config: standard MLP backbone but used in the flow-intent role.
+# The MLPActionDecoder uses emb_dim/num_layers/dropout from this config.
+defaults:
+  - mlp          # inherits network_type=mlp, emb_dim=512, num_layers=8, dropout=0.1
+  - _self_
+
+# Selects Config A: FlowIntentAgent (flow intent model + MLP action decoder).
+# Config B default is "flow_action" (standard FlowMap action policy).
+arch_variant: "flow_intent"

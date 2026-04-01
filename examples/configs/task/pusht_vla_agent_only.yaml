@@ -1,0 +1,15 @@
+# @package task
+# PushT with VLA-style CLIP + agent-only rendering (no physics step)
+# The rendered image shows the agent at the predicted action position
+# while keeping the T-block and environment unchanged.
+defaults:
+  - pusht_image
+  - _self_
+
+# VLA + agent-only renderer
+use_image_renderer: true
+renderer_type: "agent_only"
+env_type: "gym"
+
+# CLIP expects 224x224 images
+render_size: 224

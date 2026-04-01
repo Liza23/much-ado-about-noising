@@ -1,0 +1,14 @@
+# @package task
+defaults:
+  - square_mh_state
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent — square-mh task.
+#
+# See square_ph_state_hierarchical_emb.yaml for full design notes.
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4)
+intent_type: cv_proxy
+intent_predictor: true    # required for encoded_mean
+intent_horizon: 8
+intent_training_mode: joint

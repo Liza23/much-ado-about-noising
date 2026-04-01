@@ -1,0 +1,23 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Config A (flow intent) with encoded-mean intent.
+#
+# Same architecture as lift_ph_state_flow_intent.yaml (FlowIntentAgent) but
+# the flow model operates in intent_emb_dim space (64D) instead of raw 7D.
+#
+# The IntentEncoder (7 → 64D) is trained jointly with the flow intent model
+# via the flow loss.  At inference the flow ODE samples a 64D intent vector
+# directly; IntentEncoder is not used at inference.
+#
+# Compare against:
+#   lift_ph_state_flow_intent.yaml  — Config A with raw 7D intent
+#   lift_ph_state_hierarchical_emb.yaml — Config B with encoded_mean
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4); used for dataset extraction
+intent_type: mean
+intent_predictor: false   # Config A: no standalone MLP predictor; intent is a flow model
+intent_horizon: 8
+intent_training_mode: independent  # action decoder uses GT intent emb (no joint coupling)

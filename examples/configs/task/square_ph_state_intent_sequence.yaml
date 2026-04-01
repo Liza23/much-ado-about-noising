@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - square_ph_state
+  - _self_
+
+intent_conditioning: true
+intent_dim: 56       # 8 steps × 7D = full trajectory sequence [14:21] × 8
+intent_horizon: 8
+intent_predictor: true
+intent_training_mode: joint
+intent_type: sequence

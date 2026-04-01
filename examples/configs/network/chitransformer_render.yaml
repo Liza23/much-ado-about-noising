@@ -1,0 +1,10 @@
+# @package network
+# ChiTransformer wrapped with RenderAugmentedNetwork for render-augmented MIP.
+# Identical to chitransformer but adds a small future-image CNN + fusion layer
+# that conditions the decoder on a rendered future agent position between MIP steps.
+defaults:
+  - chitransformer
+  - _self_
+
+# Wrap the ChiTransformer with RenderAugmentedNetwork
+use_render_augmentation: true

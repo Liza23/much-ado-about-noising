@@ -1,0 +1,24 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Config A (flow intent) with encoded-mean intent + encoder warmup.
+#
+# Same as lift_ph_state_flow_intent_emb.yaml but IntentEncoder is frozen
+# after intent_encoder_warmup_steps=50000 steps.
+#
+# Rationale: when encoder and flow model co-train simultaneously, the flow model
+# is trying to learn a distribution over a moving 64D target. Freezing the encoder
+# after warmup gives the flow model a stable embedding space to model.
+#
+# Compare against:
+#   lift_ph_state_flow_intent_emb.yaml  — Config A with encoded_mean (no freeze)
+#   lift_ph_state_hierarchical_emb_warmup.yaml — Config B with encoded_mean + freeze
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4); used for dataset extraction
+intent_type: mean
+intent_predictor: false   # Config A: no standalone MLP predictor; intent is a flow model
+intent_horizon: 8
+intent_training_mode: independent
+intent_encoder_warmup_steps: 50000  # freeze IntentEncoder after 50k steps

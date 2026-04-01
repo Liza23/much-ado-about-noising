@@ -1,0 +1,14 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Intent conditioning with a learned predictor at inference.
+# At training time: intent = mean future eef from demo data (identical to intent_cv).
+# At inference time: a small MLP (trained jointly) predicts the intent from current obs,
+# replacing the constant-velocity proxy and eliminating train/inference distribution mismatch.
+intent_conditioning: true
+intent_dim: 7
+intent_predictor: true
+intent_horizon: 8          # HL lookahead — matches act_steps (default, backward-compatible)
+intent_training_mode: independent  # flow policy trains on GT intent; predictor trains in parallel

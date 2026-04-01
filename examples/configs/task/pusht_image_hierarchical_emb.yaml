@@ -1,0 +1,28 @@
+# @package task
+defaults:
+  - pusht_image
+  - _self_
+
+# Config B: standard flow policy conditioned on learned intent.
+# IntentPredictor (MLP) takes agent_pos and predicts mean future agent position.
+# Policy conditions on PREDICTED intent (concatenated to agent_pos) at both
+# train and eval — no distribution mismatch.
+intent_conditioning: true
+intent_dim: 2           # agent_x, agent_y
+intent_indices: [0, 1]
+intent_type: mean
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: joint
+
+# agent_pos is extended by intent_dim: shape [2] -> [4]
+shape_meta:
+  action:
+    shape: [2]
+  obs:
+    image:
+      shape: [3, 96, 96]
+      type: rgb
+    agent_pos:
+      shape: [4]
+      type: low_dim

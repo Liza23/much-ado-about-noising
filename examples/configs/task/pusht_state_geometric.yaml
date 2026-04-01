@@ -1,0 +1,13 @@
+# @package task
+# PushT state observations with geometric renderer enabled
+defaults:
+  - pusht_state
+  - _self_
+
+# Enable geometric renderer (v0: sim-based renderer with pickle fix)
+use_geometric_renderer: true
+
+# Renderer settings
+render_size: 96
+
+# Note: Use with optimization.loss_type=regression for best results

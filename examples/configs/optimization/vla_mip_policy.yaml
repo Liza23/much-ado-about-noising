@@ -1,0 +1,23 @@
+# @package optimization
+# Optimization config for VLA with MIP loss
+# Standard MIP: trains both step 1 (from zeros) and step 2 (refine near GT)
+# VLA cache ensures draft+render runs once, decoder runs twice per training step
+defaults:
+  - default
+  - _self_
+
+loss_type: "mip"
+
+# MIP step 2 noise level (0.9 = only 10% noise added to GT)
+t_two_step: 0.9
+
+# Batch size (renderer is slow, keep small)
+batch_size: 16
+
+# Standard settings
+lr: 1e-4
+weight_decay: 1e-6
+gradient_steps: 500000
+
+# Draft head loss weight (step 1 supervision)
+draft_loss_weight: 1.0

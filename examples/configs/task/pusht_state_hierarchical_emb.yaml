@@ -1,0 +1,16 @@
+# @package task
+defaults:
+  - pusht_state
+  - _self_
+
+# Config B: standard flow policy conditioned on learned intent.
+# IntentPredictor (MLP) is trained jointly: predicts mean future agent position
+# from current obs window. Policy conditions on PREDICTED intent at both train
+# and eval — no distribution mismatch.
+intent_conditioning: true
+intent_dim: 2           # agent_x, agent_y
+intent_indices: [0, 1]
+intent_type: mean
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: joint

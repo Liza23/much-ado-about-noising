@@ -1,0 +1,7 @@
+# @package network
+defaults:
+  - chiunet
+  - _self_
+
+# Wrap the ChiUNet with RenderAugmentedNetwork
+use_render_augmentation: true

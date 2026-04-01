@@ -1,0 +1,9 @@
+# @package task
+defaults:
+  - lift_ph_state_hierarchical
+  - _self_
+
+# Uses endpoint eef[t+N] as intent instead of mean(eef[t+1..t+N]).
+# Tests whether a specific waypoint target is a stronger conditioning signal
+# than an averaged trajectory summary.
+intent_type: final

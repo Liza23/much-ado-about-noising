@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 60 uv run:*)",
+      "Read(//home/ldahiya/LIBERO/libero/libero/benchmark/**)",
+      "Read(//home/ldahiya/LIBERO/libero/libero/envs/**)",
+      "Read(//home/ldahiya/LIBERO/**)",
+      "Read(//home/ldahiya/LIBERO/libero/libero/**)"
+    ]
+  }
+}

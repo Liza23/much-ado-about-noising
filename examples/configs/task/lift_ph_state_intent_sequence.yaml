@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - lift_ph_state_hierarchical
+  - _self_
+
+# Full intent sequence: intent = [eef[t+1], eef[t+2], ..., eef[t+N]] flattened to (N*7,).
+# intent_dim is auto-set to intent_horizon * 7 in train_robomimic.py.
+# Uses joint training mode so the flow policy trains on the predictor's output (not GT),
+# closing the train/inference distribution mismatch.
+intent_type: sequence
+# intent_dim will be overridden to intent_horizon*7=56 at runtime
+intent_dim: 56   # 8 * 7, kept here for reference / sbatch overrides

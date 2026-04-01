@@ -1,0 +1,618 @@
+"""Stage 1: Roll out policy variants and save action chunks to a .pkl file.
+
+Rolls out N episodes per variant, collecting predicted action chunks at every
+timestep. Also gathers steerability data for flow_intent variants (K independent
+intent samples from the same observation).
+
+Usage:
+    python examples/collect_diversity_rollouts.py \
+        --task lift_ph \
+        --run "baseline:checkpoints/lift_ph_state_flow_mlp_512_h16_seed0_success0.pt:task=lift_ph_state" \
+        --run "flow_intent:checkpoints/lift_ph_state_flow_mlp_512_h16_seed0_intent_flow_intent_success100.pt:task=lift_ph_state_flow_intent:network.arch_variant=flow_intent" \
+        --run "hierarchical_emb:checkpoints/lift_ph_state_flow_mlp_512_h16_seed0_intent_learned_joint_emb_success98.pt:task=lift_ph_state_hierarchical_emb" \
+        --n-rollouts 100 \
+        --device cuda \
+        --out rollouts/lift_ph_diversity.pkl
+
+Each --run is: "label:ckpt_path:hydra_override1:hydra_override2:..."
+The task= override selects the Hydra task config (e.g. task=lift_ph_state_flow_intent).
+Additional overrides follow standard Hydra syntax (key=value).
+
+Output .pkl structure:
+    {
+      "<task>": {
+        "<label>": {
+          "action_chunks": np.ndarray (N_total, flat_dim),  # flattened per chunk
+          "success":       list[bool],                       # per episode
+          # flow_intent only:
+          "steer_actions": np.ndarray (N_eps, K, flat_dim),
+          "steer_intents": np.ndarray (N_eps, K, intent_dim),
+        },
+        "gt_demos": {"action_chunks": np.ndarray (M, flat_dim)},
+      }
+    }
+"""
+
+import argparse
+import os
+import pickle
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)
+
+warnings.filterwarnings("ignore")
+
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+
+from tensordict import TensorDict
+from mip.agent import TrainingAgent
+from mip.flow_intent_agent import FlowIntentAgent
+from mip.intent_predictor import IntentPredictor
+from mip.datasets.robomimic_dataset import make_dataset
+from mip.envs.robomimic.robomimic_env import make_vec_env
+from mip.torch_utils import set_seed
+
+
+STEER_K = 10  # intent samples for steerability
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config loading
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_config(overrides: list[str]):
+    """Load Hydra config from a flat list of override strings (e.g. ['task=lift_ph_state', 'task.num_envs=1'])."""
+    with initialize_config_dir(
+        config_dir=str(ROOT / "examples/configs"), version_base=None
+    ):
+        cfg = compose("main", overrides=overrides)
+    return cfg
+
+
+def parse_run_spec(run_spec: str):
+    """Parse a --run argument of the form 'label:ckpt_path:override1:override2:...'
+
+    Returns:
+        label       : str
+        ckpt_path   : str
+        overrides   : list[str]
+    """
+    parts = run_spec.split(":")
+    if len(parts) < 2:
+        raise ValueError(f"--run must be 'label:ckpt_path[:override ...]', got: {run_spec}")
+    label = parts[0]
+    ckpt_path = parts[1]
+    overrides = parts[2:]
+    return label, ckpt_path, overrides
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ──────────────────────────────────────────────────────────────────────────────
+
+def setup_config_for_env(config, envs):
+    """Mirror what train_robomimic.py:main() does to set obs_dim at runtime."""
+    obs, _ = envs.reset()
+    arch_variant = getattr(config.network, "arch_variant", "flow_action")
+
+    if config.task.obs_type == "state":
+        base_obs_dim = obs.shape[-1]
+        config.task.obs_dim = base_obs_dim
+
+        if getattr(config.task, "intent_conditioning", False):
+            intent_type = getattr(config.task, "intent_type", "mean")
+            if intent_type == "sequence":
+                config.task.intent_dim = config.task.intent_horizon * 7
+
+            if arch_variant != "flow_intent":
+                _cond_dim = (
+                    getattr(config.task, "intent_emb_dim", 64)
+                    if intent_type == "encoded_mean"
+                    else config.task.intent_dim
+                )
+                config.task.obs_dim = base_obs_dim + _cond_dim
+    else:
+        config.task.obs_dim = config.network.emb_dim
+
+    return obs  # the reset obs, reuse to avoid re-reset
+
+
+def _patch_config_from_checkpoint(checkpoint_path: str, config):
+    """Peek at checkpoint weights to infer obs_dim/horizon/obs_steps and patch config.
+
+    This handles cases where the checkpoint was trained with different
+    hyperparameters than what the yaml config specifies (e.g. h6 vs h16).
+    """
+    import torch as _torch
+    sd = _torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    arch_variant = getattr(config.network, "arch_variant", "flow_action")
+
+    if arch_variant == "flow_intent":
+        # FlowIntentAgent has a separate flow_map for intent — skip for now
+        return
+
+    fm = sd.get("flow_map", {})
+    out_w = fm.get("net.main_output.weight")  # (act_dim * Ta, emb_dim)
+    in_w = fm.get("net.input_proj.weight")    # (emb_dim, input_dim)
+    if out_w is None or in_w is None:
+        return
+
+    act_dim = config.task.act_dim
+    Ta = out_w.shape[0] // act_dim  # infer horizon from output shape
+    input_dim = in_w.shape[1]
+
+    # Check if VanillaMLP (has Fourier frequencies) or plain MLP (+2 for s,t)
+    freq = fm.get("net.frequencies")
+    if freq is not None:
+        timestep_emb_dim = freq.shape[0] * 2  # num_frequencies = timestep_emb_dim // 2
+        time_contribution = 2 * timestep_emb_dim
+    else:
+        time_contribution = 2  # plain MLP: scalar s and t
+
+    obs_flat = input_dim - act_dim * Ta - time_contribution
+
+    # obs_flat = emb_dim * To  (get_network uses emb_dim as per-step obs_dim)
+    # emb_dim is the network hidden dim = encoder output per step
+    emb_dim = in_w.shape[0]  # flow network hidden dim (= emb_dim in config)
+    if obs_flat % emb_dim == 0:
+        To = obs_flat // emb_dim
+        config.task.obs_steps = To
+    # Don't touch network.emb_dim — it controls hidden dim, not just obs_dim
+
+    config.task.horizon = Ta
+    # act_steps = horizon - (obs_steps - 1), capped at horizon
+    To = config.task.obs_steps
+    config.task.act_steps = min(Ta - (To - 1), Ta)
+
+
+def load_model(checkpoint_path: str, config, dataset, device: str):
+    """Load agent and (if needed) intent predictor from checkpoint.
+
+    Returns:
+        agent            : TrainingAgent or FlowIntentAgent
+        intent_predictor : IntentPredictor | None
+
+    Note: return_intent=True is only used on FlowIntentAgent (Config A).
+    TrainingAgent (Config B) does not support it and is never called with it —
+    steer collection is gated behind `is_flow_intent` in collect_rollouts().
+
+    For encoded_mean intent (Config B) with a learned predictor, we also load
+    the _hl_policy.pt sidecar checkpoint if it exists next to the main ckpt.
+    For image obs the CV proxy is not valid for encoded_mean, so we raise if
+    the predictor is required but the sidecar is missing.
+    """
+    _patch_config_from_checkpoint(checkpoint_path, config)
+    arch_variant = getattr(config.network, "arch_variant", "flow_action")
+    if arch_variant == "flow_intent":
+        agent = FlowIntentAgent(config)
+    else:
+        agent = TrainingAgent(config)
+    agent.load(checkpoint_path, load_optimizer=False)
+    agent.eval()
+
+    intent_predictor = None
+    needs_predictor = (
+        getattr(config.task, "intent_conditioning", False)
+        and getattr(config.task, "intent_predictor", False)
+        and arch_variant != "flow_intent"
+    )
+    if needs_predictor:
+        # Determine predictor input dim: for image obs use lowdim keys; for state use base obs dim
+        if config.task.obs_type == "image":
+            _base_obs_dim = sum(
+                config.task.shape_meta["obs"][k]["shape"][0]
+                for k in dataset.lowdim_keys
+            )
+            # For PushT image, intent is concatenated into agent_pos in shape_meta ([4] not [2]).
+            # Subtract intent_dim to get the raw low-dim size that the predictor expects.
+            if getattr(config.task, "env_name", "") == "pusht":
+                _base_obs_dim -= config.task.intent_dim
+        else:
+            # base_obs_dim already set on config by setup_config_for_env
+            _base_obs_dim = config.task.obs_dim - (
+                getattr(config.task, "intent_emb_dim", 64)
+                if getattr(config.task, "intent_type", "mean") == "encoded_mean"
+                else config.task.intent_dim
+            )
+        _pred_out_dim = (
+            getattr(config.task, "intent_emb_dim", 64)
+            if getattr(config.task, "intent_type", "mean") == "encoded_mean"
+            else config.task.intent_dim
+        )
+        intent_predictor = IntentPredictor(
+            obs_steps=config.task.obs_steps,
+            base_obs_dim=_base_obs_dim,
+            intent_dim=_pred_out_dim,
+        ).to(device)
+
+        # Look for sidecar _hl_policy.pt next to the main checkpoint
+        hl_path = Path(checkpoint_path).with_name(
+            Path(checkpoint_path).stem.split("_success")[0] + "_hl_policy.pt"
+        )
+        if hl_path.exists():
+            try:
+                intent_predictor.load_state_dict(
+                    torch.load(hl_path, map_location=device, weights_only=True)
+                )
+                intent_predictor.eval()
+                print(f"  Loaded intent predictor from {hl_path}")
+            except Exception as e:
+                # If sidecar is corrupted, try extracting from main checkpoint's training_state
+                print(f"  [WARN] hl_policy.pt load failed ({e}); trying training_state in main ckpt...")
+                main_sd = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                pred_state = main_sd.get("training_state", {}).get("intent_predictor_state")
+                if pred_state is not None:
+                    intent_predictor.load_state_dict(pred_state)
+                    intent_predictor.eval()
+                    # Also fix the sidecar for next time
+                    torch.save(pred_state, hl_path)
+                    print(f"  Recovered predictor from training_state; re-saved sidecar to {hl_path}")
+                else:
+                    print(f"  [WARN] No predictor state found; falling back to CV proxy.")
+                    intent_predictor = None
+        else:
+            # No sidecar — try loading predictor state from training_state in main checkpoint.
+            # train_pusht.py saves intent_predictor_state inside the main ckpt's training_state.
+            main_sd = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            pred_state = main_sd.get("training_state", {}).get("intent_predictor_state")
+            if pred_state is not None:
+                intent_predictor.load_state_dict(pred_state)
+                intent_predictor.eval()
+                # Save sidecar so future loads skip this path
+                torch.save(pred_state, hl_path)
+                print(f"  Loaded predictor from training_state; saved sidecar to {hl_path}")
+            else:
+                print(f"  [WARN] No predictor state in ckpt; falling back to CV proxy.")
+                intent_predictor = None
+
+    return agent, intent_predictor
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Observation preprocessing (mirrors train_robomimic.py eval loop)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None):
+    """Normalize obs and build intent conditioning. Handles both state and image obs.
+
+    For state obs: obs_raw is np.ndarray (B, obs_steps, obs_dim).
+    For image obs: obs_raw is dict of np.ndarrays, keyed by obs key.
+
+    Returns:
+        obs_out      : tensor or dict — ready to pass to agent.sample()
+        lowdim_t     : (B, obs_steps, lowdim_dim) normalized lowdim tensor,
+                       used to compute CV intent proxy and for FlowIntentAgent state input.
+    """
+    arch_variant = getattr(config.network, "arch_variant", "flow_action")
+    has_intent = getattr(config.task, "intent_conditioning", False)
+    intent_type = getattr(config.task, "intent_type", "mean")
+
+    if config.task.obs_type == "state":
+        obs_f = obs_raw.astype(np.float32)
+        obs_norm = dataset.normalizer["obs"]["state"].normalize(obs_f)
+        obs_t = torch.tensor(obs_norm, device=device, dtype=torch.float32)
+        lowdim_t = obs_t  # (B, obs_steps, base_obs_dim)
+
+        if has_intent and arch_variant != "flow_intent":
+            if intent_predictor is not None:
+                with torch.no_grad():
+                    intent_proxy = intent_predictor(obs_t)  # (B, cond_dim)
+            else:
+                intent_start = dataset.intent_start
+                intent_end = dataset.intent_end
+                eef_now  = obs_t[:, -1, intent_start:intent_end]
+                eef_prev = obs_t[:, -2, intent_start:intent_end]
+                velocity = eef_now - eef_prev
+                if intent_type == "sequence":
+                    ks = torch.arange(1, config.task.intent_horizon + 1,
+                                      dtype=torch.float32, device=device)
+                    future_steps = eef_now.unsqueeze(1) + ks.view(-1, 1) * velocity.unsqueeze(1)
+                    intent_proxy = future_steps.reshape(obs_t.shape[0], -1)
+                else:
+                    half_h = (config.task.intent_horizon + 1) / 2.0
+                    intent_proxy = eef_now + half_h * velocity
+
+            intent_expanded = intent_proxy.unsqueeze(1).expand(-1, config.task.obs_steps, -1)
+            obs_t = torch.cat([obs_t, intent_expanded], dim=-1)
+
+        return obs_t, lowdim_t
+
+    else:  # image obs — mirrors train_robomimic.py eval loop lines 788-828
+        obs_dict = {}
+        for k, v in obs_raw.items():
+            v_f = v.astype(np.float32)
+            v_norm = dataset.normalizer["obs"][k].normalize(v_f)
+            obs_dict[k] = torch.tensor(v_norm, device=device, dtype=torch.float32)
+
+        # Lowdim tensor for intent proxy: concatenate all lowdim keys
+        lowdim_parts = [obs_dict[k] for k in dataset.lowdim_keys]
+        lowdim_t = torch.cat(lowdim_parts, dim=-1)  # (B, obs_steps, lowdim_dim)
+
+        if has_intent and arch_variant != "flow_intent":
+            if intent_predictor is not None:
+                with torch.no_grad():
+                    intent_proxy = intent_predictor(lowdim_t)  # (B, cond_dim)
+            else:
+                # CV proxy (only valid for non-encoded_mean types)
+                intent_start = dataset.intent_start
+                intent_end = dataset.intent_end
+                eef_now  = lowdim_t[:, -1, intent_start:intent_end]
+                eef_prev = lowdim_t[:, -2, intent_start:intent_end]
+                velocity = eef_now - eef_prev
+                half_h = (config.task.intent_horizon + 1) / 2.0
+                intent_proxy = eef_now + half_h * velocity
+
+            intent_expanded = intent_proxy.unsqueeze(1).expand(
+                -1, config.task.obs_steps, -1
+            )  # (B, obs_steps, cond_dim)
+            # PushT image: intent is concatenated into agent_pos (shape_meta specifies [4]).
+            # Robomimic image: intent is a separate lowdim key added to obs_dict.
+            if getattr(config.task, "env_name", "") == "pusht":
+                obs_dict["agent_pos"] = torch.cat(
+                    [obs_dict["agent_pos"], intent_expanded.contiguous()], dim=-1
+                )
+            else:
+                obs_dict["intent"] = intent_expanded.contiguous()
+
+        return obs_dict, lowdim_t
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rollout collection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
+                     is_flow_intent: bool = False, intent_predictor=None, num_steps: int = 9):
+    """Run n_rollouts and return action chunks + success flags.
+
+    Works for both state and image observations.
+    For flow_intent: also collects steerability data at the first timestep.
+
+    Returns:
+        action_chunks: list of 1D np arrays (flattened chunk per timestep)
+        ep_success:    list of bool, one per episode
+        steer_actions: np.ndarray (n_eps, STEER_K, flat_dim) or None
+        steer_intents: np.ndarray (n_eps, STEER_K, intent_dim) or None
+    """
+    action_chunks = []
+    ep_success = []
+    steer_actions_list = []
+    steer_intents_list = []
+    s = config.task.obs_steps - 1  # action slice start
+
+    n_done = 0
+    while n_done < n_rollouts:
+        obs, _ = envs.reset()
+        ep_reward = np.zeros(config.task.num_envs)
+        t = 0
+        first_step = True
+
+        while t < config.task.max_episode_steps:
+            obs_in, lowdim_t = preprocess_obs(
+                obs, config, dataset, device, intent_predictor=intent_predictor
+            )
+
+            # For flow_intent: use TensorDict for image obs, lowdim_t for state
+            if is_flow_intent:
+                if config.task.obs_type == "image":
+                    B_fi = next(iter(obs_in.values())).shape[0]
+                    fi_obs = TensorDict(obs_in, batch_size=B_fi)
+                else:
+                    fi_obs = lowdim_t
+
+            # Steerability: at first timestep, sample STEER_K intent/action pairs
+            if first_step and is_flow_intent:
+                ep_steer_acts = []
+                ep_steer_ints = []
+                with torch.no_grad():
+                    for _ in range(STEER_K):
+                        act_k, intent_k = agent.sample(
+                            obs=fi_obs, use_ema=True, num_steps=num_steps,
+                            return_intent=True,
+                        )
+                        act_k_un = dataset.normalizer["action"].unnormalize(act_k.cpu().numpy())
+                        ep_steer_acts.append(act_k_un[0, s:s + config.task.act_steps].flatten())
+                        ep_steer_ints.append(intent_k[0].cpu().numpy())
+                steer_actions_list.append(np.stack(ep_steer_acts))
+                steer_intents_list.append(np.stack(ep_steer_ints))
+                first_step = False
+
+            # Regular sampling
+            with torch.no_grad():
+                if is_flow_intent:
+                    act_normed = agent.sample(obs=fi_obs, use_ema=True, num_steps=num_steps)
+                else:
+                    act_0 = torch.randn(
+                        (config.task.num_envs, config.task.horizon, config.task.act_dim),
+                        device=device,
+                    )
+                    # For state obs, wrap in {"state": ...}; for image, obs_in is already a dict
+                    sample_obs = (
+                        {"state": obs_in} if config.task.obs_type == "state" else obs_in
+                    )
+                    act_normed = agent.sample(act_0=act_0, obs=sample_obs, num_steps=num_steps, use_ema=True)
+
+            act_un = dataset.normalizer["action"].unnormalize(act_normed.cpu().numpy())
+            act_chunk = act_un[:, s:s + config.task.act_steps]  # (B, act_steps, act_dim)
+            action_chunks.append(act_chunk[0].flatten())  # save before rotation undo
+
+            # Convert rotation_6d → axis-angle for env (mirrors train_robomimic.py:908-915)
+            act_env = act_chunk
+            _ABS_ACTION_ENVS = {"can", "lift", "square", "tool_hang", "transport"}
+            if getattr(config.task, "abs_action", False) and config.task.env_name in _ABS_ACTION_ENVS:
+                act_env = dataset.undo_transform_action(act_chunk)
+
+            obs, reward, terminated, truncated, info = envs.step(act_env)
+            ep_reward += reward
+            t += config.task.act_steps
+
+        ep_success.append(bool(ep_reward[0] > 0))
+        n_done += config.task.num_envs
+
+    steer_actions = np.stack(steer_actions_list) if steer_actions_list else None
+    steer_intents = np.stack(steer_intents_list) if steer_intents_list else None
+    return action_chunks, ep_success, steer_actions, steer_intents
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GT demo action collection (no env needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def collect_gt_demos(dataset, act_steps: int, obs_steps: int, max_samples: int = 2000):
+    """Pull action chunks directly from the dataset (no env rollout).
+
+    Works for both state and image datasets — both return batch["action"]
+    as normalized actions with shape (B, horizon, act_dim).
+
+    Slice: act[:, s:s+act_steps] where s = obs_steps - 1.
+    This matches exactly the slice used in collect_rollouts().
+    """
+    from torch.utils.data import DataLoader
+    loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=2, drop_last=False)
+    s = obs_steps - 1
+    chunks = []
+    for batch in loader:
+        act = batch["action"].numpy()   # (B, horizon, act_dim) — normalized
+        chunk_norm = act[:, s:s + act_steps, :]
+        chunk = dataset.normalizer["action"].unnormalize(chunk_norm)  # raw action space
+        for i in range(chunk.shape[0]):
+            chunks.append(chunk[i].flatten())
+        if len(chunks) >= max_samples:
+            break
+    return np.array(chunks[:max_samples])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Collect diversity rollouts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Each --run is: "label:ckpt_path:override1:override2:..."
+  label      — name shown in plots (e.g. baseline, flow_intent)
+  ckpt_path  — path to .pt checkpoint
+  overrides  — Hydra overrides selecting the right config (task=..., network.arch_variant=...)
+
+Example:
+  --run "baseline:checkpoints/lift_ph_state_flow_mlp_512_h16_seed0_success0.pt:task=lift_ph_state"
+  --run "flow_intent:checkpoints/lift_ph_state_flow_mlp_512_h16_seed0_intent_flow_intent_success100.pt:task=lift_ph_state_flow_intent:network.arch_variant=flow_intent"
+""",
+    )
+    parser.add_argument("--task", required=True,
+                        help="Task label used as top-level key in the output pkl (e.g. lift_ph)")
+    parser.add_argument("--run", action="append", required=True, dest="runs",
+                        metavar="label:ckpt:override...",
+                        help="Run spec (repeatable). Format: label:ckpt_path[:hydra_override ...]")
+    parser.add_argument("--n-rollouts", type=int, default=100)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--out", required=True, help="Output .pkl path")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+
+    results = {args.task: {}}
+    gt_demos_collected = False
+
+    for run_spec in args.runs:
+        label, ckpt_path, user_overrides = parse_run_spec(run_spec)
+
+        if not Path(ckpt_path).exists():
+            print(f"[SKIP] {label}: checkpoint not found at {ckpt_path}")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"Label: {label}  |  ckpt: {ckpt_path}")
+        print(f"Overrides: {user_overrides}")
+        print(f"{'='*60}")
+
+        # Merge user overrides with runtime defaults
+        overrides = user_overrides + [
+            f"optimization.device={args.device}",
+            "task.num_envs=1",
+            f"optimization.seed={args.seed}",
+        ]
+        config = load_config(overrides)
+
+        # Set up env to get obs_dim at runtime (mirrors train_robomimic.py main())
+        envs = make_vec_env(config.task, seed=args.seed)
+        setup_config_for_env(config, envs)
+
+        # Dataset (for normalizer + GT demos)
+        dataset = make_dataset(config.task)
+
+        # Load model (+ intent predictor sidecar if needed)
+        try:
+            agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device)
+        except Exception as e:
+            print(f"[ERROR] Failed to load {label}: {e}")
+            envs.close()
+            continue
+
+        arch_variant = getattr(config.network, "arch_variant", "flow_action")
+        is_fi = (arch_variant == "flow_intent")
+        print(f"arch_variant={arch_variant}  obs_type={config.task.obs_type}  "
+              f"intent_predictor={'yes' if intent_predictor else 'no/cv-proxy'}  "
+              f"|  Rolling out {args.n_rollouts} episodes...")
+
+        # Use same num_steps as training eval (9 for flow, 1 for regression/mip)
+        from mip.samplers import get_default_step_list
+        _num_steps = int(get_default_step_list(config.optimization.loss_type)[0])
+
+        chunks, successes, steer_acts, steer_ints = collect_rollouts(
+            config, agent, dataset, envs,
+            n_rollouts=args.n_rollouts,
+            device=args.device,
+            is_flow_intent=is_fi,
+            intent_predictor=intent_predictor,
+            num_steps=_num_steps,
+        )
+        envs.close()
+
+        sr = np.mean(successes)
+        print(f"  Success rate: {sr:.1%}  |  Total chunks: {len(chunks)}")
+
+        entry = {
+            "action_chunks": np.array(chunks),
+            "success": successes,
+        }
+        if steer_acts is not None:
+            entry["steer_actions"] = steer_acts
+            entry["steer_intents"] = steer_ints
+            print(f"  Steer data: {steer_acts.shape}")
+
+        results[args.task][label] = entry
+
+        # Collect GT demos once (using normalizer from whichever dataset loads first)
+        if not gt_demos_collected:
+            print("Collecting GT demo actions from dataset...")
+            gt_chunks = collect_gt_demos(dataset, act_steps=config.task.act_steps, obs_steps=config.task.obs_steps)
+            results[args.task]["gt_demos"] = {"action_chunks": gt_chunks}
+            gt_demos_collected = True
+            print(f"  GT demos: {gt_chunks.shape}")
+
+    # Save
+    with open(args.out, "wb") as f:
+        pickle.dump(results, f)
+    print(f"\nSaved to {args.out}")
+    for label, data in results[args.task].items():
+        if "action_chunks" in data:
+            print(f"  {label}: {data['action_chunks'].shape}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Hierarchical intent-conditioned policy — joint training mode.
+# High-level policy: IntentPredictor MLP predicts mean future eef (intent_horizon steps ahead).
+# Low-level policy: flow policy conditioned on HL predictor output (detached) during training,
+#   eliminating the train/inference distribution mismatch present in "independent" mode.
+# Both heads have separate optimizers and independent gradients.
+intent_conditioning: true
+intent_dim: 7
+intent_predictor: true
+intent_horizon: 8          # HL lookahead N; set independently of act_steps
+intent_training_mode: joint  # flow policy trains on HL predictor output, not GT intent

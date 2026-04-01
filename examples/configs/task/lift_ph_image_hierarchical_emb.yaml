@@ -1,0 +1,37 @@
+# @package task
+defaults:
+  - lift_ph_image
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent — image observations.
+#
+# Same joint-training approach as lift_ph_state_hierarchical_emb but with image obs.
+# IntentEncoder (7→64D) + IntentPredictor co-trained jointly via MSE.
+# Action flow policy conditions on 64D embedded intent.
+#
+# The "intent" key is added to shape_meta so MultiImageObsEncoder builds a
+# nn.Linear(64, emb_dim) for it. The dataset filters it out of lowdim_keys
+# (it's not in HDF5) — populated at training/eval time by the training loop.
+#
+# Compare against:
+#   lift_ph_image.yaml              — baseline (no intent)
+#   lift_ph_image_flow_intent.yaml  — Config A (flow intent model)
+#   lift_ph_state_hierarchical_emb.yaml — same architecture, state obs
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4); used for dataset extraction
+intent_emb_dim: 64        # IntentEncoder output dim
+intent_type: encoded_mean
+intent_predictor: true    # required: CV proxy invalid in embedding space
+intent_horizon: 8
+intent_training_mode: joint
+
+# Add synthetic "intent" key so MultiImageObsEncoder includes a linear layer for it.
+# Hydra merges this with the parent's shape_meta.obs dict.
+# lowdim_dim = 3+4+2 = 9; cond_dim = intent_emb_dim = 64
+shape_meta:
+  obs:
+    intent:
+      shape:
+        - 64
+      type: low_dim
+      synthetic: true  # not an env obs key; skip in RobomimicImageWrapper, used by encoder only

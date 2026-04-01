@@ -1,0 +1,39 @@
+# @package task
+defaults:
+  - _self_
+
+env_name: "libero_spatial"
+env_type: "state"
+obs_type: "state"
+abs_action: false  # LIBERO uses OSC_POSE delta actions by default
+
+# Path to a single task's HDF5 file. Override at runtime with task.dataset_path=...
+# e.g. ~/datasets/libero_spatial/pick_up_the_black_bowl_on_the_plate_demo.hdf5
+dataset_path: null
+
+# Path to the task's BDDL file for evaluation (required).
+# e.g. ~/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_on_the_plate.bddl
+bddl_file: null
+
+# Observation keys to concatenate into the state vector.
+# Adjust based on which keys are present in your task's HDF5.
+obs_keys:
+  - robot0_eef_pos       # 3D
+  - robot0_eef_quat      # 4D
+  - robot0_gripper_qpos  # 2D
+  - object               # varies per task (typically 44D for libero_spatial)
+
+max_episode_steps: 600
+
+# Task parameters
+obs_steps: 2
+act_steps: 8
+horizon: 16
+num_envs: 10
+save_video: false
+val_dataset_percentage: 0.0
+
+# Dimensions — set obs_dim to match actual concatenated obs size at runtime.
+# For libero_spatial state: 3+4+2+44 = 53.  Override if your task differs.
+act_dim: 7   # OSC_POSE delta: dx dy dz droll dpitch dyaw grip
+obs_dim: 53

@@ -1,0 +1,15 @@
+# @package task
+# PushT image task with agent-only rendering for the render-augmented baseline.
+# Used with chitransformer_render network (ResNet18 + ChiTransformer + RenderAugmentedNetwork).
+# render_size=96 matches the main observation image size (no upscaling needed).
+defaults:
+  - pusht_image
+  - _self_
+
+# Enable agent-only rendering (teleport agent to predicted position, no physics step)
+use_image_renderer: true
+renderer_type: "agent_only"
+env_type: "gym"
+
+# 96×96 matches main obs images — future encoder uses same resolution
+render_size: 96

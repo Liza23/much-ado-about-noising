@@ -1,0 +1,15 @@
+# @package task
+defaults:
+  - square_mh_state
+  - _self_
+
+# Config A (flow intent) with encoded-mean intent — square-mh task.
+#
+# See square_ph_state_flow_intent_emb.yaml for full design notes.
+intent_conditioning: true
+intent_dim: 7
+intent_emb_dim: 64
+intent_type: encoded_mean
+intent_predictor: false
+intent_horizon: 8
+intent_training_mode: independent

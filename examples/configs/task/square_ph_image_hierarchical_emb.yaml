@@ -1,0 +1,25 @@
+# @package task
+defaults:
+  - square_ph_image
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent — square-ph image observations.
+#
+# Same as lift_ph_image_hierarchical_emb but for the harder square task.
+# Square has more rotation variety → encoded mean is especially important
+# (raw quaternion mean is less valid for large rotations).
+intent_conditioning: true
+intent_dim: 7
+intent_emb_dim: 64
+intent_type: encoded_mean
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: joint
+
+shape_meta:
+  obs:
+    intent:
+      shape:
+        - 64
+      type: low_dim
+      synthetic: true  # not an env obs key; skip in RobomimicImageWrapper, used by encoder only

@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - pusht_state
+  - _self_
+
+# Enable agent-only renderer for state-based obs
+# ChiUNet base uses MLP encoder (state obs), future image encoded by ResNet18 in RenderAugmentedNetwork
+use_image_renderer: true
+renderer_type: "agent_only"
+env_type: "gym"
+render_size: 96

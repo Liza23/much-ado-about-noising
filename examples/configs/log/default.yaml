@@ -1,0 +1,14 @@
+# @package log
+defaults:
+  - _self_
+
+log_dir: "/data/user_data/ldahiya/mip_render/${log.group}/${log.exp_name}"
+wandb_mode: "online"
+project: "mip_render"
+group: "default"
+exp_name: "default"
+eval_freq: 10000
+log_freq: 1000
+save_freq: 10000
+eval_episodes: 50
+save_video: True

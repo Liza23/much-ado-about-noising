@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - lift_mh_image
+  - _self_
+
+intent_conditioning: true
+intent_dim: 7
+intent_type: cv_proxy
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: joint

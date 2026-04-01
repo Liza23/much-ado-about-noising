@@ -1,0 +1,12 @@
+# @package task
+# Config A: flow-based intent model + deterministic MLP action decoder — square-ph
+defaults:
+  - square_ph_state
+  - _self_
+
+intent_conditioning: true
+intent_dim: 7         # eef_pos (3) + eef_quat (4)
+intent_horizon: 8
+intent_predictor: false
+intent_training_mode: independent
+intent_type: mean

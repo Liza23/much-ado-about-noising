@@ -1,0 +1,17 @@
+# @package task
+defaults:
+  - lift_mh_state
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent — lift-mh task.
+#
+# See lift_ph_state_hierarchical_emb.yaml for full design notes.
+# mh dataset contains both proficient and less-skilled demos, making
+# multimodal intent more important than in the ph case.
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4)
+intent_emb_dim: 64        # IntentEncoder output dim
+intent_type: encoded_mean
+intent_predictor: true    # required for encoded_mean
+intent_horizon: 8
+intent_training_mode: joint

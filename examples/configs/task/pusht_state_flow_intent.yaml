@@ -1,0 +1,14 @@
+# @package task
+defaults:
+  - pusht_state
+  - _self_
+
+# Config A: flow model predicts 2D agent position intent, MLP decodes actions.
+# Intent = mean future agent position (indices 0:2 of 5D state) over next intent_horizon steps.
+intent_conditioning: true
+intent_dim: 2           # agent_x, agent_y
+intent_indices: [0, 1]  # indices in 5D state: [agent_x, agent_y, block_x, block_y, block_angle]
+intent_type: mean
+intent_predictor: false
+intent_horizon: 8
+intent_training_mode: independent

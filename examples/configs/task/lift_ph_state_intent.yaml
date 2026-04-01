@@ -1,0 +1,10 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Intent conditioning: augments obs with mean future eef pose (pos + quat = 7D)
+# over the next act_steps steps. Intent is concatenated to each obs step before
+# encoding, increasing effective obs_dim by intent_dim at runtime.
+intent_conditioning: true
+intent_dim: 7

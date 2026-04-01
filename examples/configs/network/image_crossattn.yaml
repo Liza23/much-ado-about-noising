@@ -1,0 +1,11 @@
+# @package network
+defaults:
+  - _base  # Inherit shared encoder configs
+  - _self_
+
+network_type: "image_crossattn_policy"
+emb_dim: 256
+num_layers: 3
+n_heads: 4
+dropout: 0.1
+encoder_type: "identity"  # Network has built-in CNN encoder

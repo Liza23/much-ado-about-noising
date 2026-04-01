@@ -1,0 +1,7 @@
+# @package task
+defaults:
+  - can_ph_state_hierarchical
+  - _self_
+
+intent_type: sequence
+intent_dim: 56   # 8 * 7, overridden at runtime

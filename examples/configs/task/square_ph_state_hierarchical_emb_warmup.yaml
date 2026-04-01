@@ -1,0 +1,17 @@
+# @package task
+defaults:
+  - square_ph_state
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent + encoder warmup — square-ph.
+#
+# Compare against:
+#   square_ph_state_hierarchical_emb.yaml  — Config B with encoded_mean (no freeze)
+#   square_ph_state_flow_intent_emb_warmup.yaml — Config A with encoded_mean + freeze
+intent_conditioning: true
+intent_dim: 7
+intent_type: cv_proxy
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: joint
+intent_encoder_warmup_steps: 50000

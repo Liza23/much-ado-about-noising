@@ -1,0 +1,15 @@
+# @package network
+# Geometric policy network with sim-based renderer (v0)
+defaults:
+  - _base
+  - _self_
+
+network_type: "geometric_policy"
+emb_dim: 256
+num_layers: 3
+dropout: 0.0
+use_layer_norm: false
+
+# Use identity encoder - geometric policy does its own encoding
+encoder_type: "identity"
+encoder_dropout: 0.0

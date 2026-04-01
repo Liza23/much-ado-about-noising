@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - tool_hang_ph_image
+  - _self_
+
+# Render-augmented training: load sim states and enable renderer
+load_sim_states: true
+use_image_renderer: true
+renderer_type: "robomimic_eef"
+render_camera_name: "sideview"
+render_size: 84

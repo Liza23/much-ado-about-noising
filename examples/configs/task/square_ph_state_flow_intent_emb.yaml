@@ -1,0 +1,16 @@
+# @package task
+defaults:
+  - square_ph_state
+  - _self_
+
+# Config A (flow intent) with encoded-mean intent — square-ph task.
+#
+# See lift_ph_state_flow_intent_emb.yaml for full design notes.
+# Square is the harder task — this is the apples-to-apples Config A comparison
+# for square against square_ph_state_hierarchical_emb (Config B).
+intent_conditioning: true
+intent_dim: 7
+intent_type: mean
+intent_predictor: false
+intent_horizon: 8
+intent_training_mode: independent

@@ -1,0 +1,27 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Config B (hierarchical) with encoded-mean intent.
+#
+# Instead of mean(eef[t+1..t+N]) in raw 7D space (geometrically problematic
+# for quaternions), each future eef step is first encoded by a small per-step
+# MLP (IntentEncoder: 7 → intent_emb_dim), then the N embeddings are
+# mean-pooled → intent_emb_dim-D vector.
+#
+# The IntentEncoder is co-trained with the IntentPredictor via the intent MSE
+# loss, learning an embedding space that is predictable from current obs.
+# The action flow policy conditions on intent_emb_dim-D instead of 7D.
+#
+# Compare against:
+#   lift_ph_state_hierarchical.yaml  — raw 7D mean (Config B baseline)
+#   lift_ph_state_flow_intent.yaml   — Config A (flow model in 7D space)
+#   lift_ph_state_flow_intent_emb.yaml — Config A with encoded_mean
+intent_conditioning: true
+intent_dim: 7             # raw eef dim (pos3+quat4); used for dataset extraction
+intent_emb_dim: 64        # IntentEncoder output dim
+intent_type: encoded_mean
+intent_predictor: true    # required: CV proxy has no meaning in embedding space
+intent_horizon: 8
+intent_training_mode: joint
