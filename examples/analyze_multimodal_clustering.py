@@ -61,10 +61,17 @@ from clustering_shared import (
 
 # Color palette matching analyze_diversity.py
 METHOD_COLORS = {
-    "baseline":         "#1f77b4",
-    "hierarchical_emb": "#ff7f0e",
-    "flow_intent":      "#2ca02c",
-    "gt_demos":         "#e377c2",
+    # MLP variants
+    "baseline":                  "#1f77b4",
+    "hierarchical_emb":          "#ff7f0e",
+    "flow_intent":               "#2ca02c",
+    "flow_intent_emb":           "#17becf",
+    # ChiUNet variants
+    "baseline_chiunet":          "#6baed6",
+    "hierarchical_emb_chiunet":  "#e6550d",
+    "flow_intent_chiunet_action":"#756bb1",
+    # Other
+    "gt_demos":                  "#e377c2",
 }
 
 
@@ -417,10 +424,13 @@ def fig_metrics_table(all_metrics: dict, out_dir: Path, task_name: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict,
-                         out_dir: Path, task_name: str, dt=0.1, vel_dims=7, abs_action=False):
+                         out_dir: Path, task_name: str, dt=0.1, vel_dims=7,
+                         abs_action=False, include_umap_ghosts=False):
     """Side-by-side 3D ghost plots for each variant at one critical state.
 
     Fits a single global PCA across all variants so the projections are comparable.
+    UMAP ghost plots are optional because the nonlinear projection can materially
+    distort apparent cross-variant spread when every trajectory point is embedded.
     """
     variants = list(variant_data.keys())
     all_trajs = {}
@@ -451,61 +461,244 @@ def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict
     ts = critical_meta["timestep"][state_idx]
     var_score = critical_meta["variance_score"][state_idx]
 
-    # Fit a global UMAP basis as an additional nonlinear embedding.
+    # Optional global UMAP basis. This is disabled by default because the
+    # nonlinear projection can make trajectory spread look inverted relative to
+    # the underlying clustering geometry.
     umap_model = None
-    if HAS_UMAP and all_pts.shape[0] >= 3:
-        n_neighbors = max(2, min(30, all_pts.shape[0] - 1))
-        umap_model = umap.UMAP(
-            n_components=n_comp, random_state=42, n_neighbors=n_neighbors, n_jobs=1
-        ).fit(all_pts)
-    elif not HAS_UMAP:
-        print("[warn] UMAP not installed; skipping ghost UMAP figure.")
+    if include_umap_ghosts:
+        if HAS_UMAP and all_pts.shape[0] >= 3:
+            n_neighbors = max(2, min(30, all_pts.shape[0] - 1))
+            umap_model = umap.UMAP(
+                n_components=n_comp, random_state=42, n_neighbors=n_neighbors, n_jobs=1
+            ).fit(all_pts)
+        elif not HAS_UMAP:
+            print("[warn] UMAP not installed; skipping ghost UMAP figure.")
 
-    # Split variants into two rows:
-    #   Row 1: baseline, hierarchical_emb, flow_intent (h8 / default)
-    #   Row 2: flow_intent_h16, flow_intent_h32, flow_intent_h64, flow_intent_h128
-    _row1_order = ["baseline", "hierarchical_emb", "flow_intent"]
-    _row2_prefixes = ["flow_intent_h"]
-    row1 = [v for v in _row1_order if v in variants]
-    row2 = [v for v in variants if any(v.startswith(p) for p in _row2_prefixes)]
-    # fallback: if no h-variants exist, keep original single-row layout
-    if not row2:
-        row1 = variants
-    rows_layout = [r for r in [row1, row2] if r]
-    n_rows = len(rows_layout)
-    n_cols = max(len(r) for r in rows_layout)
+    def _plot_variant_panel(ax, projector, axis_prefix: str, var: str, point_cloud_only: bool = False):
+        trajs = all_trajs[var]
+        labels = all_labels[var]
+        n_clusters = len(np.unique(labels))
+        cmap = plt.cm.tab10
+
+        for i, traj in enumerate(trajs):
+            xyz = projector(traj)
+            if xyz.shape[1] < 3:
+                xyz = np.pad(xyz, ((0, 0), (0, 3 - xyz.shape[1])))
+            color = cmap(labels[i] / max(n_clusters - 1, 1))
+            if point_cloud_only:
+                ax.scatter(
+                    xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                    s=6, alpha=0.18, color=color,
+                )
+                ax.scatter(
+                    [xyz[0, 0]], [xyz[0, 1]], [xyz[0, 2]],
+                    s=18, c="none", edgecolor="k", linewidths=0.6, marker="o",
+                )
+                ax.scatter(
+                    [xyz[-1, 0]], [xyz[-1, 1]], [xyz[-1, 2]],
+                    s=22, c="k", linewidths=0.8, marker="x",
+                )
+                continue
+
+            ax.plot(
+                xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                linewidth=0.8, alpha=0.5, color=color,
+            )
+            ax.scatter(
+                [xyz[0, 0]], [xyz[0, 1]], [xyz[0, 2]],
+                s=15, c="none", edgecolor="k", linewidths=0.5, marker="o",
+            )
+
+        ax.set_title(f"{var}\n(k={n_clusters})", fontsize=9, fontweight="bold")
+        ax.set_xlabel(f"{axis_prefix}1", fontsize=7)
+        ax.set_ylabel(f"{axis_prefix}2", fontsize=7)
+        ax.set_zlabel(f"{axis_prefix}3", fontsize=7)
+        ax.tick_params(labelsize=5)
+        _equalize_3d(ax)
+
+    def _save_family_ghost(
+        family_variants,
+        projector,
+        axis_prefix: str,
+        title_suffix: str,
+        file_name: str,
+        family_label: str,
+        point_cloud_only: bool = False,
+    ) -> Path | None:
+        family_variants = [v for v in family_variants if v in variants]
+        if not family_variants:
+            return None
+
+        fig = plt.figure(figsize=(5 * len(family_variants), 5))
+        for ci, var in enumerate(family_variants):
+            ax = fig.add_subplot(1, len(family_variants), ci + 1, projection="3d")
+            _plot_variant_panel(
+                ax, projector, axis_prefix, var, point_cloud_only=point_cloud_only
+            )
+
+        fig.suptitle(
+            f"[{task_name}] State #{state_idx} (t={ts}, probe_var={var_score:.4f})\n"
+            f"Ghost action trajectories per variant [{family_label}] ({title_suffix})",
+            fontsize=10, fontweight="bold",
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.9])
+        out_path = out_dir / file_name
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {out_path}")
+        return out_path
+
+    def _render_family_plotly(
+        family_variants,
+        projector,
+        file_name: str,
+        family_label: str,
+        axis_prefix: str,
+        point_cloud_only: bool = False,
+    ) -> None:
+        if not HAS_PLOTLY:
+            return
+
+        family_variants = [v for v in family_variants if v in variants]
+        if not family_variants:
+            return
+
+        fig_p = go.Figure()
+        for var in family_variants:
+            trajs = all_trajs[var]
+            labels = all_labels[var]
+            n_clusters = len(np.unique(labels))
+            colors_plotly = plt.cm.tab10(np.linspace(0, 1, max(n_clusters, 1)))
+
+            for i, traj in enumerate(trajs):
+                xyz = projector(traj)
+                if xyz.shape[1] < 3:
+                    xyz = np.pad(xyz, ((0, 0), (0, 3 - xyz.shape[1])))
+                ci = labels[i]
+                r, g, b, _ = colors_plotly[ci % len(colors_plotly)]
+                color_rgba = f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.18)"
+                if point_cloud_only:
+                    fig_p.add_trace(go.Scatter3d(
+                        x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
+                        mode="markers",
+                        marker=dict(size=2.5, color=color_rgba),
+                        name=f"{var} C{ci}",
+                        legendgroup=f"{var}_C{ci}",
+                        showlegend=(i == np.where(labels == ci)[0][0]),
+                        hoverinfo="name",
+                    ))
+                    fig_p.add_trace(go.Scatter3d(
+                        x=[xyz[0, 0]], y=[xyz[0, 1]], z=[xyz[0, 2]],
+                        mode="markers",
+                        marker=dict(size=4, color="rgba(0,0,0,0)", line=dict(color="black", width=2), symbol="circle-open"),
+                        name=f"{var} start",
+                        legendgroup=f"{var}_start",
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ))
+                    fig_p.add_trace(go.Scatter3d(
+                        x=[xyz[-1, 0]], y=[xyz[-1, 1]], z=[xyz[-1, 2]],
+                        mode="markers",
+                        marker=dict(size=4, color="black", symbol="x"),
+                        name=f"{var} end",
+                        legendgroup=f"{var}_end",
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ))
+                else:
+                    fig_p.add_trace(go.Scatter3d(
+                        x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
+                        mode="lines",
+                        line=dict(width=3, color=f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.4)"),
+                        name=f"{var} C{ci}",
+                        legendgroup=f"{var}_C{ci}",
+                        showlegend=(i == np.where(labels == ci)[0][0]),
+                        hoverinfo="name",
+                    ))
+
+        fig_p.update_layout(
+            title=f"[{task_name}] State #{state_idx} (t={ts}) — ghost trajectories [{family_label}]",
+            scene=dict(
+                xaxis_title=f"{axis_prefix}1",
+                yaxis_title=f"{axis_prefix}2",
+                zaxis_title=f"{axis_prefix}3",
+            ),
+            margin=dict(l=0, r=0, b=0, t=40),
+        )
+        fig_p.write_html(str(out_dir / file_name), include_plotlyjs="cdn")
+
+    kitchen_standard = ["baseline", "hierarchical_emb", "flow_intent"]
+    kitchen_chiunet = ["baseline_chiunet", "hierarchical_emb_chiunet", "flow_intent_chiunet"]
+    is_kitchen_split = task_name == "kitchen_state"
+
+    if is_kitchen_split:
+        family_specs = [
+            ("standard", "standard", kitchen_standard),
+            ("chiunet", "chiunet", kitchen_chiunet),
+        ]
+        for family_slug, family_label, family_variants in family_specs:
+            family_present = [v for v in family_variants if v in variants]
+            if not family_present:
+                continue
+
+            family_pts = np.vstack([t for var in family_present for t in all_trajs[var]])
+            n_comp_family = min(3, family_pts.shape[1])
+            pca_family = PCA(n_components=n_comp_family, random_state=0).fit(family_pts)
+
+            umap_family = None
+            if include_umap_ghosts and HAS_UMAP and family_pts.shape[0] >= 3:
+                n_neighbors = max(2, min(30, family_pts.shape[0] - 1))
+                umap_family = umap.UMAP(
+                    n_components=n_comp_family, random_state=42, n_neighbors=n_neighbors, n_jobs=1
+                ).fit(family_pts)
+
+            _save_family_ghost(
+                family_present,
+                projector=pca_family.transform,
+                axis_prefix="PC",
+                title_suffix="global PCA",
+                file_name=f"ghost_comparison_{family_slug}_state{state_idx:02d}.png",
+                family_label=family_label,
+            )
+            _render_family_plotly(
+                family_present,
+                projector=pca_family.transform,
+                file_name=f"ghost_comparison_{family_slug}_state{state_idx:02d}.html",
+                family_label=family_label,
+                axis_prefix="PC",
+            )
+
+            if umap_family is not None:
+                _save_family_ghost(
+                    family_present,
+                    projector=umap_family.transform,
+                    axis_prefix="UMAP",
+                    title_suffix="global UMAP point cloud",
+                    file_name=f"ghost-umap_comparison_{family_slug}_state{state_idx:02d}.png",
+                    family_label=family_label,
+                    point_cloud_only=True,
+                )
+                _render_family_plotly(
+                    family_present,
+                    projector=umap_family.transform,
+                    file_name=f"ghost-umap_comparison_{family_slug}_state{state_idx:02d}.html",
+                    family_label=family_label,
+                    axis_prefix="UMAP",
+                    point_cloud_only=True,
+                )
+        return
+
+    # Fallback for non-kitchen tasks and legacy layouts.
     def _save_matplotlib_ghost(
-        projector, axis_prefix: str, title_suffix: str, file_name: str
+        projector, axis_prefix: str, title_suffix: str, file_name: str,
+        point_cloud_only: bool = False,
     ) -> Path:
-        fig = plt.figure(figsize=(5 * n_cols, 5 * n_rows))
-        for ri, row_variants in enumerate(rows_layout):
-            for ci, var in enumerate(row_variants):
-                ax = fig.add_subplot(n_rows, n_cols, ri * n_cols + ci + 1, projection="3d")
-                trajs = all_trajs[var]
-                labels = all_labels[var]
-                n_clusters = len(np.unique(labels))
-                cmap = plt.cm.tab10
-
-                for i, traj in enumerate(trajs):
-                    xyz = projector(traj)
-                    if xyz.shape[1] < 3:
-                        xyz = np.pad(xyz, ((0, 0), (0, 3 - xyz.shape[1])))
-                    color = cmap(labels[i] / max(n_clusters - 1, 1))
-                    ax.plot(
-                        xyz[:, 0], xyz[:, 1], xyz[:, 2],
-                        linewidth=0.8, alpha=0.5, color=color,
-                    )
-                    ax.scatter(
-                        [xyz[0, 0]], [xyz[0, 1]], [xyz[0, 2]],
-                        s=15, c="none", edgecolor="k", linewidths=0.5, marker="o",
-                    )
-
-                ax.set_title(f"{var}\n(k={n_clusters})", fontsize=9, fontweight="bold")
-                ax.set_xlabel(f"{axis_prefix}1", fontsize=7)
-                ax.set_ylabel(f"{axis_prefix}2", fontsize=7)
-                ax.set_zlabel(f"{axis_prefix}3", fontsize=7)
-                ax.tick_params(labelsize=5)
-                _equalize_3d(ax)
+        fig = plt.figure(figsize=(5 * len(variants), 5))
+        for ci, var in enumerate(variants):
+            ax = fig.add_subplot(1, len(variants), ci + 1, projection="3d")
+            _plot_variant_panel(
+                ax, projector, axis_prefix, var, point_cloud_only=point_cloud_only
+            )
 
         fig.suptitle(
             f"[{task_name}] State #{state_idx} (t={ts}, probe_var={var_score:.4f})\n"
@@ -519,7 +712,7 @@ def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict
         print(f"Saved: {out_path}")
         return out_path
 
-    path = _save_matplotlib_ghost(
+    _save_matplotlib_ghost(
         projector=pca.transform,
         axis_prefix="PC",
         title_suffix="global PCA",
@@ -530,39 +723,18 @@ def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict
         _save_matplotlib_ghost(
             projector=umap_model.transform,
             axis_prefix="UMAP",
-            title_suffix="global UMAP",
+            title_suffix="global UMAP point cloud",
             file_name=f"ghost-umap_comparison_state{state_idx:02d}.png",
+            point_cloud_only=True,
         )
 
-    # Plotly HTML version
-    if HAS_PLOTLY:
-        fig_p = go.Figure()
-        for vi, var in enumerate(variants):
-            trajs = all_trajs[var]
-            labels = all_labels[var]
-            n_clusters = len(np.unique(labels))
-            colors_plotly = plt.cm.tab10(np.linspace(0, 1, max(n_clusters, 1)))
-
-            for i, traj in enumerate(trajs):
-                xyz = pca.transform(traj)
-                ci = labels[i]
-                r, g, b, _ = colors_plotly[ci % len(colors_plotly)]
-                fig_p.add_trace(go.Scatter3d(
-                    x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
-                    mode="lines",
-                    line=dict(width=3, color=f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.4)"),
-                    name=f"{var} C{ci}",
-                    legendgroup=f"{var}_C{ci}",
-                    showlegend=(i == np.where(labels == ci)[0][0]),
-                    hoverinfo="name",
-                ))
-        fig_p.update_layout(
-            title=f"[{task_name}] State #{state_idx} (t={ts}) — ghost trajectories",
-            scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"),
-            margin=dict(l=0, r=0, b=0, t=40),
-        )
-        fig_p.write_html(str(out_dir / f"ghost_comparison_state{state_idx:02d}.html"),
-                         include_plotlyjs="cdn")
+    _render_family_plotly(
+        variants,
+        projector=pca.transform,
+        file_name=f"ghost_comparison_state{state_idx:02d}.html",
+        family_label="all variants",
+        axis_prefix="PC",
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
@@ -581,10 +753,22 @@ def main():
                         help="Time step for velocity integration (1/control_freq)")
     parser.add_argument("--vel-dims", type=int, default=7,
                         help="Number of velocity dimensions in action vector")
-    parser.add_argument("--abs-action", action="store_true", default=True,
-                        help="Actions are absolute positions (not velocities); skip cumsum (default: True)")
+    parser.add_argument(
+        "--abs-action",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Treat actions as absolute positions instead of relative velocities.",
+    )
     parser.add_argument("--n-ghost-states", type=int, default=5,
                         help="Number of top critical states to render ghost plots for")
+    parser.add_argument(
+        "--include-umap-ghosts",
+        action="store_true",
+        help=(
+            "Also render UMAP ghost plots. Disabled by default because the "
+            "nonlinear embedding can invert apparent trajectory spread."
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -615,6 +799,8 @@ def main():
     print(f"Variants: {variants}")
     print(f"Critical states: {n_critical}")
     print(f"Clustering k range: [{args.k_min}, {args.k_max}]")
+    if not args.include_umap_ghosts:
+        print("Ghost UMAP plots disabled by default; use --include-umap-ghosts to enable.")
 
     # ── Phase 1: Cluster per variant x per state ──────────────────────────────
     all_vdr = {v: [] for v in variants}
@@ -686,6 +872,7 @@ def main():
             fig_ghost_comparison(
                 variant_data, si, critical, ghost_dir, args.task,
                 dt=args.dt, vel_dims=args.vel_dims, abs_action=args.abs_action,
+                include_umap_ghosts=args.include_umap_ghosts,
             )
 
     # ── Save clustering results CSV ───────────────────────────────────────────

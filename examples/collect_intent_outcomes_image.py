@@ -26,6 +26,7 @@ Only supports robomimic tasks (lift, square, can) with flow_intent checkpoints.
 import argparse
 import os
 import pickle
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -54,7 +55,125 @@ from collect_diversity_rollouts import (
 )
 from mip.datasets.robomimic_dataset import make_dataset as make_dataset_robomimic
 from mip.envs.robomimic.robomimic_env import make_vec_env as make_vec_env_robomimic
+from mip.datasets.kitchen_dataset import make_dataset as make_dataset_kitchen
+from mip.envs.kitchen import make_vec_env as make_vec_env_kitchen
+from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
+from mip.envs.libero import make_vec_env as make_vec_env_libero
+from robosuite.models.objects import MujocoXMLObject
 from sklearn.cluster import KMeans
+
+
+def _is_kitchen(config):
+    return "kitchen" in getattr(config.task, "env_name", "")
+
+
+def _is_libero(config):
+    return getattr(config.task, "env_name", "").startswith("libero")
+
+
+def maybe_register_libero_pro_objects(config):
+    """Load LIBERO-PRO custom object classes into the active LIBERO registry.
+
+    Some LIBERO-PRO checkouts ship custom object classes whose XML paths are not
+    valid relative to the current environment. We register corrected runtime
+    classes here so perturbation suites can instantiate without modifying the
+    external LIBERO trees.
+    """
+    if not _is_libero(config):
+        return
+
+    bddl_file = os.path.expanduser(getattr(config.task, "bddl_file", "") or "")
+    if "LIBERO-PRO" not in bddl_file:
+        return
+
+    from libero.libero.envs.base_object import OBJECTS_DICT
+
+    def _make_runtime_object_class(class_name, xml_path, rotation, rotation_axis):
+        xml_path = os.path.abspath(xml_path)
+
+        def __init__(self, name=None, obj_name=None):
+            name = name or "_".join(re.sub(r"([A-Z])", r" \1", class_name).split()).lower()
+            MujocoXMLObject.__init__(
+                self,
+                xml_path,
+                name=name,
+                joints=[dict(type="free", damping="0.0005")],
+                obj_type="all",
+                duplicate_collision_geoms=False,
+            )
+            self.category_name = "_".join(
+                re.sub(r"([A-Z])", r" \1", self.__class__.__name__).split()
+            ).lower()
+            self.object_properties = {"vis_site_names": {}}
+            self.rotation = rotation
+            self.rotation_axis = rotation_axis
+
+        return type(class_name, (MujocoXMLObject,), {"__init__": __init__})
+
+    zero_rot = {
+        "x": (0.0, 0.0),
+        "y": (0.0, 0.0),
+        "z": (0.0, 0.0),
+    }
+    mug_rot = {
+        "x": (-np.pi / 2, -np.pi / 2),
+        "y": (-np.pi, -np.pi),
+        "z": (np.pi, np.pi),
+    }
+
+    asset_specs = {
+        "red_sticker": (
+            "RedSticker",
+            os.path.expanduser(
+                "~/LIBERO-PRO/libero/libero/assets/stable_scanned_objects/red_sticker/red_sticker.xml"
+            ),
+            zero_rot,
+            "z",
+        ),
+        "blue_red_sticker": (
+            "BlueRedSticker",
+            str(ROOT / "examples" / "assets" / "blue_red_sticker.xml"),
+            zero_rot,
+            "z",
+        ),
+        "red_box": (
+            "RedBox",
+            str(ROOT / "examples" / "assets" / "red_box.xml"),
+            zero_rot,
+            "z",
+        ),
+        "libero_mug_yellow": (
+            "LiberoMugYellow",
+            os.path.expanduser(
+                "~/LIBERO-PRO/notebooks/custom_assets/libero_mug_yellow/libero_mug_yellow.xml"
+            ),
+            mug_rot,
+            None,
+        ),
+    }
+
+    for key, (class_name, xml_path, rotation, rotation_axis) in asset_specs.items():
+        if not os.path.exists(xml_path):
+            continue
+        OBJECTS_DICT[key] = _make_runtime_object_class(
+            class_name, xml_path, rotation, rotation_axis
+        )
+
+
+def make_vec_env(config, seed):
+    if _is_libero(config):
+        return make_vec_env_libero(config.task, seed=seed)
+    if _is_kitchen(config):
+        return make_vec_env_kitchen(config.task, seed=seed)
+    return make_vec_env_robomimic(config.task, seed=seed)
+
+
+def make_dataset(config):
+    if _is_libero(config):
+        return make_dataset_libero(config.task)
+    if _is_kitchen(config):
+        return make_dataset_kitchen(config.task)
+    return make_dataset_robomimic(config.task)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -104,8 +223,65 @@ def get_robomimic_env(envs):
     raise RuntimeError("Could not find robomimic env with get_state() in wrapper chain")
 
 
-def get_sim_state(envs):
-    """Capture full MuJoCo simulator state."""
+def _get_libero_base(envs):
+    """Walk wrapper chain to find the base LIBERO gym wrapper."""
+    from mip.envs.libero.libero_env_wrapper import LiberoGymWrapper
+
+    e = envs.envs[0]
+    while e is not None:
+        if isinstance(e, LiberoGymWrapper):
+            return e
+        e = getattr(e, 'env', None)
+    raise RuntimeError("Could not find LiberoGymWrapper in env chain")
+
+
+def _stack_obs_for_policy(cur, config):
+    """Expand a single observation into an obs_steps buffer."""
+    if config.task.obs_type == "state":
+        return np.stack([cur] * config.task.obs_steps, axis=0)[np.newaxis]
+    return {k: np.stack([v] * config.task.obs_steps, axis=0)[np.newaxis] for k, v in cur.items()}
+
+
+def _get_current_obs(envs, config):
+    """Return the latest single-step observation from the active env."""
+    if _is_libero(config):
+        base = _get_libero_base(envs)
+        cur = getattr(base, "_last_obs", None)
+        if cur is None:
+            raw_obs = base._env.regenerate_obs_from_state(base._env.get_sim_state())
+            base._last_obs = base._get_obs(raw_obs)
+            cur = base._last_obs
+        if config.task.obs_type == "state":
+            return cur.copy()
+        return {k: v.copy() for k, v in cur.items()}
+
+    inner = get_inner_lowdim(envs)
+    return inner.get_observation()
+
+
+def _get_inner_step_env(envs, config):
+    """Return the env object to step one action at a time."""
+    if _is_libero(config):
+        return _get_libero_base(envs)
+    return get_inner_lowdim(envs)
+
+
+def _step_inner(inner, action):
+    """Compatibility helper for old Gym 4-tuple and Gymnasium 5-tuple step APIs."""
+    result = inner.step(action)
+    if len(result) == 5:
+        _, reward, terminated, truncated, info = result
+        done = bool(terminated) or bool(truncated)
+    else:
+        _, reward, done, info = result
+        done = bool(done)
+    return float(reward), done, info
+
+
+def get_sim_state(envs, config):
+    """Capture full simulator state."""
+    if _is_libero(config):
+        return _get_libero_base(envs)._env.get_sim_state().copy()
     return get_robomimic_env(envs).get_state()["states"].copy()
 
 
@@ -116,6 +292,18 @@ def restore_env_obs(envs, sim_state, config, ensure_fresh_reset=False):
     is restored — we do NOT go through MultiStepWrapper.reset(), which would trigger
     a full random robomimic reset and clobber the desired state.
     """
+    if _is_libero(config):
+        base = _get_libero_base(envs)
+        # LIBERO / robosuite can keep an internal terminated flag after a
+        # successful rollout; a fresh reset clears it before state restore.
+        try:
+            base._env.reset()
+        except Exception:
+            pass
+        raw_obs = base._env.regenerate_obs_from_state(sim_state)
+        base._last_obs = base._get_obs(raw_obs)
+        return _stack_obs_for_policy(_get_current_obs(envs, config), config)
+
     robo_env = get_robomimic_env(envs)
     inner    = get_inner_lowdim(envs)
     if ensure_fresh_reset:
@@ -126,46 +314,50 @@ def restore_env_obs(envs, sim_state, config, ensure_fresh_reset=False):
         except Exception:
             pass
     robo_env.reset_to({"states": sim_state})
-    if config.task.obs_type == "state":
-        cur = inner.get_observation()  # (obs_dim,)
-        return np.stack([cur] * config.task.obs_steps, axis=0)[np.newaxis]
-    else:
-        cur = inner.get_observation()  # dict
-        return {k: np.stack([v] * config.task.obs_steps, axis=0)[np.newaxis]
-                for k, v in cur.items()}
+    cur = inner.get_observation()
+    return _stack_obs_for_policy(cur, config)
 
 
 def update_obs_buf(obs_buf, envs, config):
     """Roll obs_buf one step and insert latest observation."""
-    inner = get_inner_lowdim(envs)
+    new_obs = _get_current_obs(envs, config)
     if config.task.obs_type == "state":
-        new_obs = inner.get_observation()
         obs_buf = np.roll(obs_buf, -1, axis=1)
         obs_buf[0, -1] = new_obs
     else:
-        new_obs = inner.get_observation()
         for k in obs_buf:
             obs_buf[k] = np.roll(obs_buf[k], -1, axis=1)
             obs_buf[k][0, -1] = new_obs[k]
     return obs_buf
 
 
-def get_eef_from_envs(envs):
-    """Get EEF position from raw robomimic env (works for state + image)."""
+def get_eef_from_envs(envs, config):
+    """Get EEF position from the active env (works for robomimic + LIBERO image/state)."""
+    if _is_libero(config):
+        try:
+            state = _get_current_obs(envs, config)
+            if isinstance(state, dict):
+                state = state["state"]
+            return np.asarray(state[:3], dtype=np.float32).copy()
+        except Exception:
+            return np.zeros(3)
     try:
         return get_robomimic_env(envs).get_observation()["robot0_eef_pos"].copy()
     except Exception:
         return np.zeros(3)
 
 
-def render_frame(envs):
-    """Render an RGB frame from the inner robomimic wrapper.
+def render_frame(envs, config):
+    """Render an RGB frame from the active env.
 
     For image obs: get_inner_lowdim() returns RobomimicImageWrapper, whose
     render() returns render_cache — the agentview/eye-in-hand frame cached by
     the last get_observation() call.
     """
-    inner = get_inner_lowdim(envs)  # RobomimicImageWrapper or RobomimicLowdimWrapper
+    if _is_libero(config):
+        inner = _get_libero_base(envs)
+    else:
+        inner = get_inner_lowdim(envs)  # RobomimicImageWrapper or RobomimicLowdimWrapper
     frame = inner.render(mode="rgb_array")
 
     # Robosuite / mujoco can return buffers backed by mutable internal memory.
@@ -237,7 +429,7 @@ def run_full_episode_fixed_intent(envs, sim_state, fixed_intent, agent, config,
     obs_buf = restore_env_obs(envs, sim_state, config)
     s = config.task.obs_steps - 1
     act_steps = config.task.act_steps
-    inner = get_inner_lowdim(envs)
+    inner = _get_inner_step_env(envs, config)
     done = False
     total_reward = 0.0
     total_steps = 0
@@ -249,9 +441,8 @@ def run_full_episode_fixed_intent(envs, sim_state, fixed_intent, agent, config,
             if total_steps >= max_steps:
                 break
             act = undo_action(action_un[0, s + a_i], config, dataset)
-            _, reward, done, info = inner.step(act)
-            done = bool(done)
-            total_reward += float(reward)
+            reward, done, info = _step_inner(inner, act)
+            total_reward += reward
             total_steps += 1
             if done:
                 break
@@ -272,7 +463,7 @@ def run_full_episode_ode(envs, sim_state, agent, config, dataset, device, num_st
     obs_buf = restore_env_obs(envs, sim_state, config)
     s = config.task.obs_steps - 1
     act_steps = config.task.act_steps
-    inner = get_inner_lowdim(envs)
+    inner = _get_inner_step_env(envs, config)
     done = False
     total_reward = 0.0
     total_steps = 0
@@ -287,9 +478,8 @@ def run_full_episode_ode(envs, sim_state, agent, config, dataset, device, num_st
             if total_steps >= max_steps:
                 break
             act = undo_action(act_un[0, s + a_i], config, dataset)
-            _, reward, done, info = inner.step(act)
-            done = bool(done)
-            total_reward += float(reward)
+            reward, done, info = _step_inner(inner, act)
+            total_reward += reward
             total_steps += 1
             if done:
                 break
@@ -313,7 +503,7 @@ def run_full_episode_intent_seed(envs, sim_state, seed_intent, agent, config,
     obs_buf = restore_env_obs(envs, sim_state, config)
     s = config.task.obs_steps - 1
     act_steps = config.task.act_steps
-    inner = get_inner_lowdim(envs)
+    inner = _get_inner_step_env(envs, config)
     done = False
     total_reward = 0.0
     total_steps = 0
@@ -336,9 +526,8 @@ def run_full_episode_intent_seed(envs, sim_state, seed_intent, agent, config,
             if total_steps >= max_steps:
                 break
             act = undo_action(action_un[0, s + a_i], config, dataset)
-            _, reward, done, info = inner.step(act)
-            done = bool(done)
-            total_reward += float(reward)
+            reward, done, info = _step_inner(inner, act)
+            total_reward += reward
             total_steps += 1
             if done:
                 break
@@ -356,18 +545,17 @@ def run_fixed_intent_rollout(envs, obs_buf, fixed_intent, agent, config, dataset
                               device, n_future_steps, capture_render, num_steps=9):
     """Step env for n_future_steps with a fixed intent centroid.
 
-    Uses get_inner_lowdim (RobomimicLowdimWrapper) directly so that:
+    Uses the inner single-step env directly so that:
     - Actions are applied one-at-a-time (not as chunks)
-    - The 4-value gym step API (obs, reward, done, info) is used
     - MultiStepWrapper's stale done-state from prior episodes is bypassed
     """
     s = config.task.obs_steps - 1
     act_steps = config.task.act_steps
-    inner = get_inner_lowdim(envs)  # RobomimicLowdimWrapper — 4-value step API
-    eef_traj = [get_eef_from_envs(envs)]
+    inner = _get_inner_step_env(envs, config)
+    eef_traj = [get_eef_from_envs(envs, config)]
     frames = []
     if capture_render:
-        f0 = render_frame(envs)
+        f0 = render_frame(envs, config)
         if f0 is not None:
             frames.append(f0)
     done = False
@@ -378,11 +566,10 @@ def run_fixed_intent_rollout(envs, obs_buf, fixed_intent, agent, config, dataset
         remaining = n_future_steps - step_i
         for a_i in range(min(act_steps, remaining)):
             act = undo_action(action_un[0, s + a_i], config, dataset)
-            _, reward, done, info = inner.step(act)   # 4-value old-gym API
-            done = bool(done)
-            eef_traj.append(get_eef_from_envs(envs))
+            _, done, info = _step_inner(inner, act)
+            eef_traj.append(get_eef_from_envs(envs, config))
             if capture_render:
-                f = render_frame(envs)
+                f = render_frame(envs, config)
                 if f is not None:
                     frames.append(f)
             if done:
@@ -426,8 +613,8 @@ def collect_outcomes(config, agent, dataset, envs, args, device):
                     probe_intents.append(iv[0].cpu().numpy())
             variance = float(np.stack(probe_intents).var(axis=0).mean())
 
-            sim_state = get_sim_state(envs)
-            eef_pos = get_eef_from_envs(envs)
+            sim_state = get_sim_state(envs, config)
+            eef_pos = get_eef_from_envs(envs, config)
             obs_snap = obs.copy() if config.task.obs_type == "state" else \
                        {k2: v.copy() for k2, v in obs.items()}
 
@@ -622,7 +809,28 @@ def _normalize_render_frame(frame):
     return arr
 
 
-def fig_eef_trajectories(outcomes, out_dir, task_name, obs_type):
+def _intent_xyz_for_plot(intent_vec):
+    """First 3 components of an intent vector as Cartesian xyz for 3D plots.
+
+    Matches training targets where intent begins with EE position (e.g. LIBERO
+    ``ee_states``: pos3 + axis-angle3 — only position is drawn here).
+    """
+    if intent_vec is None:
+        return None
+    z = np.asarray(intent_vec, dtype=np.float64).reshape(-1)
+    if z.size < 3:
+        return None
+    return z[:3]
+
+
+def fig_eef_trajectories(
+    outcomes,
+    out_dir,
+    task_name,
+    obs_type,
+    show_intent_position=False,
+    figure_filename="eef_trajectories.png",
+):
     """Plot EEF trajectories in 3D per critical state, colored by intent cluster."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
@@ -645,6 +853,7 @@ def fig_eef_trajectories(outcomes, out_dir, task_name, obs_type):
         ax.scatter(*start_eef, c="black", s=80, marker="o", depthshade=False,
                    label="start" if ci == 0 else None, zorder=10)
 
+        intent_legend_done = False
         for ki, co in enumerate(outcome["cluster_outcomes"]):
             traj = co["eef_trajectory"]   # (T, 3)
             xyz_points.append(traj)
@@ -654,6 +863,26 @@ def fig_eef_trajectories(outcomes, out_dir, task_name, obs_type):
                     color=c, alpha=0.85, lw=1.8, label=label)
             ax.scatter(traj[-1, 0], traj[-1, 1], traj[-1, 2],
                        color=c, s=80, marker="*", depthshade=False, zorder=5)
+            if show_intent_position:
+                pz = _intent_xyz_for_plot(co.get("intent"))
+                if pz is not None:
+                    xyz_points.append(pz)
+                    ilab = "intent z[:3]" if (ci == 0 and not intent_legend_done) else None
+                    if ilab is not None:
+                        intent_legend_done = True
+                    ax.scatter(
+                        pz[0],
+                        pz[1],
+                        pz[2],
+                        color=c,
+                        s=85,
+                        marker="^",
+                        depthshade=False,
+                        edgecolors="black",
+                        linewidths=0.5,
+                        zorder=8,
+                        label=ilab,
+                    )
 
         # Keep all axes at comparable scale so 3D geometry is not visually distorted.
         xyz = np.vstack(xyz_points)
@@ -677,11 +906,17 @@ def fig_eef_trajectories(outcomes, out_dir, task_name, obs_type):
         if ci == 0:
             ax.legend(fontsize=7, loc="upper left")
 
-    fig.suptitle(f"[{task_name}] EEF trajectories under fixed intent clusters\n"
-                 "(●=start  ★=end)",
-                 fontsize=12, fontweight="bold")
+    sub = "(●=start  ★=end"
+    if show_intent_position:
+        sub += "  ^=centroid intent, z[:3] (target EE pos in training space)"
+    sub += ")"
+    fig.suptitle(
+        f"[{task_name}] EEF trajectories under fixed intent clusters\n{sub}",
+        fontsize=12,
+        fontweight="bold",
+    )
     plt.tight_layout()
-    path = out_dir / "eef_trajectories.png"
+    path = out_dir / figure_filename
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -758,7 +993,7 @@ def fig_rendered_frames_filtered(outcomes, out_dir, task_name, success_only=Fals
             else:
                 ax.text(0.5, 0.5, "No frame", ha="center", va="center", fontsize=8)
             sr = _cluster_success_rate(outcome, ki)
-            ax.set_title(f"C{ki+1} end (sr={sr:.2f})", fontsize=8)
+            ax.set_title(f"C{ki+1} end ({sr:.2f})", fontsize=8)
             ax.axis("off")
 
         # Hide any unused columns for this row.
@@ -778,7 +1013,15 @@ def fig_rendered_frames_filtered(outcomes, out_dir, task_name, success_only=Fals
     print(f"Saved: {path}")
 
 
-def fig_trajectories_with_frames(outcomes, out_dir, task_name, success_only=False, success_threshold=0.5):
+def fig_trajectories_with_frames(
+    outcomes,
+    out_dir,
+    task_name,
+    success_only=False,
+    success_threshold=0.5,
+    show_intent_position=False,
+    figure_filename="eef_trajectories_with_frames.png",
+):
     """Combined view: 3D EEF trajectory + rendered start/end frames per state."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
@@ -816,6 +1059,7 @@ def fig_trajectories_with_frames(outcomes, out_dir, task_name, success_only=Fals
             label="start" if ci == 0 else None,
             zorder=10,
         )
+        intent_legend_done = False
         for ki in keep_indices:
             co = outcome["cluster_outcomes"][ki]
             traj = co["eef_trajectory"]
@@ -833,6 +1077,26 @@ def fig_trajectories_with_frames(outcomes, out_dir, task_name, success_only=Fals
                 depthshade=False,
                 zorder=5,
             )
+            if show_intent_position:
+                pz = _intent_xyz_for_plot(co.get("intent"))
+                if pz is not None:
+                    xyz_points.append(pz)
+                    ilab = "intent z[:3]" if (ci == 0 and not intent_legend_done) else None
+                    if ilab is not None:
+                        intent_legend_done = True
+                    ax3d.scatter(
+                        pz[0],
+                        pz[1],
+                        pz[2],
+                        color=c,
+                        s=70,
+                        marker="^",
+                        depthshade=False,
+                        edgecolors="black",
+                        linewidths=0.45,
+                        zorder=8,
+                        label=ilab,
+                    )
 
         xyz = np.vstack(xyz_points)
         xyz_min = xyz.min(axis=0)
@@ -876,7 +1140,7 @@ def fig_trajectories_with_frames(outcomes, out_dir, task_name, success_only=Fals
             else:
                 ax.text(0.5, 0.5, "No frame", ha="center", va="center", fontsize=8)
             sr = _cluster_success_rate(outcome, ki)
-            ax.set_title(f"C{ki+1} end (sr={sr:.2f})", fontsize=8)
+            ax.set_title(f"C{ki+1} end ({sr:.2f})", fontsize=8)
             ax.axis("off")
 
         # Hide unused columns in this row.
@@ -885,14 +1149,17 @@ def fig_trajectories_with_frames(outcomes, out_dir, task_name, success_only=Fals
             ax_empty.axis("off")
 
     subtitle = "successful clusters only" if success_only else "all clusters"
+    legend_bits = "●=start  ★=end"
+    if show_intent_position:
+        legend_bits += "  ^=intent z[:3]"
     fig.suptitle(
         f"[{task_name}] Trajectories + rendered outcomes per intent cluster\n"
-        f"(●=start  ★=end, {subtitle})",
+        f"({legend_bits}, {subtitle})",
         fontsize=11,
         fontweight="bold",
     )
     plt.tight_layout()
-    path = out_dir / "eef_trajectories_with_frames.png"
+    path = out_dir / figure_filename
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -1004,6 +1271,13 @@ def main():
                              "states where high-level goal choice is being made.")
     parser.add_argument("--render", action="store_true",
                         help="Capture rendered RGB frames during rollouts")
+    parser.add_argument(
+        "--plot-intent-xyz",
+        action="store_true",
+        help="Also save eef_trajectories_with_intent_xyz.png and "
+        "(with --render) eef_trajectories_with_frames_intent_xyz.png: same panels as "
+        "the default figures, plus ^ markers at intent z[:3]. Default PNGs are unchanged.",
+    )
     parser.add_argument("--render-success-only", action="store_true",
                         help="When --render is enabled, only include successful cluster "
                              "outcomes in rendered figures (uses full-episode trial "
@@ -1027,11 +1301,12 @@ def main():
     config.task.num_envs = 1
     # Reuse save_video flag to request offscreen rendering contexts for state envs.
     config.task.save_video = bool(args.render)
+    maybe_register_libero_pro_objects(config)
 
     # Setup env + dataset
-    envs = make_vec_env_robomimic(config.task, seed=args.seed)
+    envs = make_vec_env(config, seed=args.seed)
     setup_config_for_env(config, envs)
-    dataset = make_dataset_robomimic(config.task)
+    dataset = make_dataset(config)
 
     # Load model
     agent, _ = load_model(ckpt_path, config, dataset, args.device)
@@ -1062,7 +1337,22 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else out_path.parent / (out_path.stem + "_figs")
     out_dir.mkdir(parents=True, exist_ok=True)
     task_name = f"{config.task.env_name} [{label}]"
-    fig_eef_trajectories(outcomes, out_dir, task_name, config.task.obs_type)
+    fig_eef_trajectories(
+        outcomes,
+        out_dir,
+        task_name,
+        config.task.obs_type,
+        show_intent_position=False,
+    )
+    if args.plot_intent_xyz:
+        fig_eef_trajectories(
+            outcomes,
+            out_dir,
+            task_name,
+            config.task.obs_type,
+            show_intent_position=True,
+            figure_filename="eef_trajectories_with_intent_xyz.png",
+        )
     if args.n_trials > 0:
         fig_success_rates(outcomes, out_dir, task_name, args.k_clusters)
     if args.render and outcomes and outcomes[0]["cluster_outcomes"][0]["frames"]:
@@ -1079,7 +1369,18 @@ def main():
             task_name,
             success_only=args.render_success_only,
             success_threshold=args.success_threshold,
+            show_intent_position=False,
         )
+        if args.plot_intent_xyz:
+            fig_trajectories_with_frames(
+                outcomes,
+                out_dir,
+                task_name,
+                success_only=args.render_success_only,
+                success_threshold=args.success_threshold,
+                show_intent_position=True,
+                figure_filename="eef_trajectories_with_frames_intent_xyz.png",
+            )
 
     print(f"\nAll figures saved to {out_dir}")
 

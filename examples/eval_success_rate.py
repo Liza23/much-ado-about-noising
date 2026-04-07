@@ -30,17 +30,29 @@ warnings.filterwarnings("ignore")
 from mip.torch_utils import set_seed
 from mip.datasets.robomimic_dataset import make_dataset as make_dataset_robomimic
 from mip.datasets.pusht_dataset import make_dataset as make_dataset_pusht
+from mip.datasets.kitchen_dataset import make_dataset as make_dataset_kitchen
+from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
 from mip.envs.robomimic.robomimic_env import make_vec_env as make_vec_env_robomimic
 from mip.envs.pusht import make_vec_env as make_vec_env_pusht
+from mip.envs.kitchen import make_vec_env as make_vec_env_kitchen
+from mip.envs.libero import make_vec_env as make_vec_env_libero
 
 def make_vec_env(task_config, seed):
+    if getattr(task_config, "env_name", "").startswith("libero"):
+        return make_vec_env_libero(task_config, seed=seed)
     if task_config.env_name == "pusht":
         return make_vec_env_pusht(task_config)
+    if "kitchen" in task_config.env_name:
+        return make_vec_env_kitchen(task_config, seed=seed)
     return make_vec_env_robomimic(task_config, seed=seed)
 
 def make_dataset(task_config):
+    if getattr(task_config, "env_name", "").startswith("libero"):
+        return make_dataset_libero(task_config)
     if task_config.env_name == "pusht":
         return make_dataset_pusht(task_config)
+    if "kitchen" in task_config.env_name:
+        return make_dataset_kitchen(task_config)
     return make_dataset_robomimic(task_config)
 
 from collect_diversity_rollouts import (
@@ -106,9 +118,6 @@ def main():
         is_fi = (arch_variant == "flow_intent")
         num_steps = int(get_default_step_list(config.optimization.loss_type)[0])
 
-        # For non-flow_intent agents, use stochastic sampling so the comparison
-        # is fair: flow_intent always draws fresh randn for intent, so baseline/
-        # hier_emb should also draw fresh randn for action noise.
         if not is_fi:
             agent.config.optimization.sample_mode = "stochastic"
 
@@ -118,14 +127,22 @@ def main():
               f"num_steps={num_steps}")
         print(f"  Running {args.n_rollouts} episodes...")
 
-        _, successes, _, _ = collect_rollouts(
-            config, agent, dataset, envs,
-            n_rollouts=args.n_rollouts,
-            device=args.device,
-            is_flow_intent=is_fi,
-            intent_predictor=intent_predictor,
-            num_steps=num_steps,
-        )
+        try:
+            _, successes, _, _ = collect_rollouts(
+                config, agent, dataset, envs,
+                n_rollouts=args.n_rollouts,
+                device=args.device,
+                is_flow_intent=is_fi,
+                intent_predictor=intent_predictor,
+                num_steps=num_steps,
+            )
+        except Exception as e:
+            print(f"  [ERROR] Rollout failed for {label}: {e}")
+            envs.close()
+            rows.append({"variant": label, "success_rate": "ERROR",
+                         "n_success": "ERROR", "n_total": args.n_rollouts,
+                         "checkpoint": ckpt_path})
+            continue
         envs.close()
 
         sr = float(np.mean(successes))

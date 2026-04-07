@@ -1,0 +1,14 @@
+# @package task
+defaults:
+  - libero_spatial_state
+  - _self_
+
+intent_conditioning: true
+intent_dim: 6
+intent_emb_dim: 64
+intent_type: encoded_mean
+intent_predictor: true
+intent_horizon: 8
+intent_training_mode: joint
+intent_keys:
+  - ee_states

@@ -1,0 +1,29 @@
+# @package task
+# LIBERO-PRO evaluation config for the spatial task suite.
+# Inherits training parameters from libero_spatial_state and adds
+# LIBERO-PRO specific eval settings.
+defaults:
+  - libero_spatial_state
+  - _self_
+
+# --- LIBERO-PRO eval settings ---
+
+# Root of the cloned LIBERO-PRO repository.
+libero_pro_root: "/home/ldahiya/LIBERO-PRO"
+
+# Suite(s) to evaluate on.  Pass a list to sweep multiple suites:
+#   eval.suites=[libero_spatial,libero_spatial_with_mug,libero_spatial_with_diffpos_stick]
+#
+# P0 (original):
+#   libero_spatial
+# P1 (task perturbation):
+#   libero_spatial_with_mug, libero_spatial_with_red_stick,
+#   libero_spatial_with_yellow_book, libero_spatial_with_blue_stick,
+#   libero_spatial_with_green_mug, libero_spatial_with_milk,
+#   libero_spatial_with_red_box
+# P2 (position perturbation):
+#   libero_spatial_with_diffpos_stick
+pro_suite: "libero_spatial"
+
+# Number of fixed initial states to roll out per task (max available is ~50).
+n_init_states: 20

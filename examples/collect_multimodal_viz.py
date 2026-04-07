@@ -71,17 +71,29 @@ from mip.flow_intent_agent import FlowIntentAgent
 from mip.intent_predictor import IntentPredictor
 from mip.datasets.robomimic_dataset import make_dataset as make_dataset_robomimic
 from mip.datasets.pusht_dataset import make_dataset as make_dataset_pusht
+from mip.datasets.kitchen_dataset import make_dataset as make_dataset_kitchen
+from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
 from mip.envs.robomimic.robomimic_env import make_vec_env as make_vec_env_robomimic
 from mip.envs.pusht import make_vec_env as make_vec_env_pusht
+from mip.envs.kitchen import make_vec_env as make_vec_env_kitchen
+from mip.envs.libero import make_vec_env as make_vec_env_libero
 
 def make_vec_env(task_config, seed=0):
+    if getattr(task_config, "env_name", "").startswith("libero"):
+        return make_vec_env_libero(task_config, seed=seed)
     if task_config.env_name == "pusht":
         return make_vec_env_pusht(task_config)
+    if "kitchen" in task_config.env_name:
+        return make_vec_env_kitchen(task_config, seed=seed)
     return make_vec_env_robomimic(task_config, seed=seed)
 
 def make_dataset(task_config):
+    if getattr(task_config, "env_name", "").startswith("libero"):
+        return make_dataset_libero(task_config)
     if task_config.env_name == "pusht":
         return make_dataset_pusht(task_config)
+    if "kitchen" in task_config.env_name:
+        return make_dataset_kitchen(task_config)
     return make_dataset_robomimic(task_config)
 from mip.torch_utils import set_seed
 
@@ -163,7 +175,12 @@ def find_critical_states(config, agent, dataset, envs, device,
                 obs_raw_snapshot = {k: v.copy() for k, v in obs.items()}
 
             # Get eef position from unnormalized obs
-            obs_f = obs.astype(np.float32) if config.task.obs_type == "state" else None
+            if config.task.obs_type == "state":
+                obs_f = obs.astype(np.float32)
+            elif isinstance(obs_raw_snapshot, dict) and "state" in obs_raw_snapshot:
+                obs_f = obs_raw_snapshot["state"].astype(np.float32)
+            else:
+                obs_f = None
             eef_pos = np.zeros(3)
             if obs_f is not None:
                 intent_start = getattr(dataset, "intent_start", None)
@@ -561,17 +578,24 @@ def main():
     print("Phase 1: Full rollouts for diversity analysis")
     print(f"{'=' * 60}")
 
+    failed_labels = set()
     for v in loaded_variants:
         label = v["label"]
         print(f"\n  [{label}] Rolling out {args.n_rollouts} episodes...")
-        chunks, successes, steer_acts, steer_ints = collect_rollouts_simple(
-            v["config"], v["agent"], v["dataset"], v["envs"],
-            n_rollouts=args.n_rollouts,
-            device=args.device,
-            is_flow_intent=v["is_fi"],
-            intent_predictor=v["intent_predictor"],
-            num_steps=v["num_steps"],
-        )
+        try:
+            chunks, successes, steer_acts, steer_ints = collect_rollouts_simple(
+                v["config"], v["agent"], v["dataset"], v["envs"],
+                n_rollouts=args.n_rollouts,
+                device=args.device,
+                is_flow_intent=v["is_fi"],
+                intent_predictor=v["intent_predictor"],
+                num_steps=v["num_steps"],
+            )
+        except Exception as e:
+            print(f"  [{label}] [ERROR] Rollout failed: {e}")
+            v["envs"].close()
+            failed_labels.add(label)
+            continue
         sr = np.mean(successes)
         print(f"  [{label}] Success rate: {sr:.1%}  |  Chunks: {len(chunks)}")
 
@@ -585,6 +609,8 @@ def main():
             print(f"  [{label}] Steer data: {steer_acts.shape}")
 
         results[args.task][label] = entry
+
+    loaded_variants = [v for v in loaded_variants if v["label"] not in failed_labels]
 
     # ── Phase 2: Find critical states ─────────────────────────────────────────
     # Use the first variant (typically baseline) to discover critical states

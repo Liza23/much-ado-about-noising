@@ -2,63 +2,68 @@
 
 Wraps LIBERO's ControlEnv in a Gymnasium-compatible interface and stacks
 observations / multi-steps using the shared MIP env utilities.
+
+The LIBERO HDF5 demos store obs with keys like ``ee_states``,
+``gripper_states``, ``joint_states`` which are *different* from the raw
+robosuite obs keys (``robot0_eef_pos``, ``robot0_eef_quat``, etc.).
+This wrapper bridges that gap by mapping the live-env obs to the same
+representation as the HDF5 dataset.
+
+HDF5-to-env key mapping (matching create_dataset.py):
+    ee_pos          (3)  <->  robot0_eef_pos                      (3)
+    ee_ori          (3)  <->  quat2axisangle(robot0_eef_quat)     (4 -> 3)
+    ee_states       (6)  <->  [ee_pos, quat2axisangle(eef_quat)]
+    gripper_states  (2)  <->  robot0_gripper_qpos                 (2)
+    joint_states    (7)  <->  robot0_joint_pos                    (7)
 """
+
+import math
+
+import mip.envs.libero._robosuite_compat  # noqa: F401  — patches must run first
 
 import numpy as np
 import gymnasium as gym
 from gymnasium.spaces import Box
 
-# Robosuite 1.5.x compatibility: patch renamed/removed APIs before LIBERO imports them.
-import robosuite as _suite
-if not hasattr(_suite, "load_controller_config"):
-    _suite.load_controller_config = _suite.load_part_controller_config
-
-from robosuite.environments.manipulation.manipulation_env import ManipulationEnv as _ManipEnv
-_orig_manip_init = _ManipEnv.__init__
-def _patched_manip_init(self, *args, **kwargs):
-    kwargs.pop("mount_types", None)  # removed in robosuite 1.5.x
-    _orig_manip_init(self, *args, **kwargs)
-_ManipEnv.__init__ = _patched_manip_init
-
-# LIBERO custom robot models: patch for robosuite 1.5.x API changes.
-# - arms = ["right"] required by FixedBaseRobot
-# - default_mount -> default_base
-# - default_gripper returns str -> dict {"right": ...}
-from libero.libero.envs.robots.mounted_panda import MountedPanda as _MountedPanda
-from libero.libero.envs.robots.on_the_ground_panda import OnTheGroundPanda as _OnTheGroundPanda
-
-for _cls in (_MountedPanda, _OnTheGroundPanda):
-    if not hasattr(_cls, "arms"):
-        _cls.arms = ["right"]
-    if not hasattr(_cls, "default_base"):
-        _mount = _cls.default_mount.fget(_cls) if isinstance(_cls.default_mount, property) else _cls.default_mount
-        _cls.default_base = property(lambda self, _m=_mount: _m)
-    # robosuite 1.5.x expects default_gripper to return {"right": gripper_name}
-    _orig_gripper = _cls.default_gripper
-    if isinstance(_orig_gripper, property):
-        _cls.default_gripper = property(
-            lambda self, _p=_orig_gripper: {"right": _p.fget(self)}
-            if isinstance(_p.fget(self), str) else _p.fget(self)
-        )
-
 from mip.config import TaskConfig
 from mip.env_utils import MultiStepWrapper, VideoRecorder, VideoRecordingWrapper
 
+_HDF5_KEY_TO_ENV = {
+    "ee_pos": ("robot0_eef_pos",),
+    "ee_ori": ("robot0_eef_quat",),  # needs quat -> axis-angle conversion
+    "ee_states": ("robot0_eef_pos", "robot0_eef_quat"),  # concat pos + quat2axisangle
+    "gripper_states": ("robot0_gripper_qpos",),
+    "joint_states": ("robot0_joint_pos",),
+}
+
+
+def _quat_to_axisangle(q: np.ndarray) -> np.ndarray:
+    """Convert quaternion [x, y, z, w] to axis-angle (3D).
+
+    Matches robosuite's T.quat2axisangle used in LIBERO's create_dataset.py.
+    """
+    w = q[..., 3].copy()
+    w = np.clip(w, -1.0, 1.0)
+    # For batched or single input
+    xyz = q[..., :3]
+    den = np.sqrt(1.0 - w * w)
+    # avoid division by zero (near-zero rotation)
+    safe = den > 1e-10
+    angle = 2.0 * np.arccos(w)
+    if q.ndim == 1:
+        if safe:
+            return xyz * angle / den
+        return np.zeros(3)
+    result = np.where(safe[..., None], xyz * (angle / np.where(safe, den, 1.0))[..., None], 0.0)
+    return result
+
 
 def make_vec_env(task_config: TaskConfig, seed=None):
-    """Create a vectorized LIBERO environment.
-
-    Args:
-        task_config: Task config. Must include:
-            - bddl_file: path to the task BDDL file
-            - obs_keys: list of robosuite observation keys to concatenate
-            - obs_steps, act_steps, max_episode_steps, num_envs, save_video
-        seed: Random seed.
-
-    Returns:
-        Vectorized gymnasium environment.
-    """
-    if task_config.num_envs == 1 or task_config.save_video:
+    """Create a vectorized LIBERO environment."""
+    obs_type = getattr(task_config, "obs_type", "state")
+    if task_config.num_envs == 1 or task_config.save_video or obs_type == "image":
+        # Image obs: async forked workers compete for EGL contexts and fail.
+        # Use sync for sequential, single-process offscreen rendering.
         vec_cls = gym.vector.SyncVectorEnv
     else:
         vec_cls = gym.vector.AsyncVectorEnv
@@ -74,9 +79,15 @@ def make_vec_env(task_config: TaskConfig, seed=None):
 
 def _make_single_env(task_config: TaskConfig, idx: int, render: bool = False, seed=None):
     def thunk():
+        obs_type = getattr(task_config, "obs_type", "state")
+        image_obs_keys = list(getattr(task_config, "image_obs_keys", None) or [])
+        render_camera = getattr(task_config, "render_camera_name", "agentview")
         env = LiberoGymWrapper(
             bddl_file=task_config.bddl_file,
             obs_keys=task_config.obs_keys,
+            obs_type=obs_type,
+            image_obs_keys=image_obs_keys,
+            render_camera=render_camera,
         )
 
         video_recorder = VideoRecorder.create_h264(
@@ -104,76 +115,127 @@ def _make_single_env(task_config: TaskConfig, idx: int, render: bool = False, se
     return thunk
 
 
+_IMG_KEY_TO_CAMERA = {
+    "agentview_rgb": "agentview",
+    "eye_in_hand_rgb": "robot0_eye_in_hand",
+}
+
+
 class LiberoGymWrapper(gym.Env):
     """Gymnasium wrapper around LIBERO's ControlEnv.
 
-    Converts the robosuite obs dict → flat numpy array and exposes the
-    standard Gymnasium API (reset/step with terminated/truncated).
+    Accepts obs_keys in HDF5 naming convention (``ee_states``,
+    ``gripper_states``, ``joint_states``) and automatically maps them
+    to the live robosuite env's observation keys, including
+    quaternion → axis-angle conversion for orientation.
 
-    Args:
-        bddl_file: Absolute path to the BDDL problem file for the task.
-        obs_keys: Robosuite obs keys to concatenate into the state vector.
-        render_hw: (height, width) for render().
-        render_camera: Camera name for render().
+    For image observations, set obs_type="image" and provide image_obs_keys
+    (e.g. ["agentview_rgb", "eye_in_hand_rgb"]). The observation_space
+    becomes a Dict with both state ("state") and image keys.
     """
 
     def __init__(
         self,
         bddl_file: str,
         obs_keys: list[str],
+        obs_type: str = "state",
+        image_obs_keys: list[str] | None = None,
         render_hw: tuple[int, int] = (256, 256),
         render_camera: str = "agentview",
     ):
-        from libero.libero.envs.env_wrapper import OffScreenRenderEnv
+        from libero.libero.envs.env_wrapper import ControlEnv
 
         self.obs_keys = obs_keys
+        self.obs_type = obs_type
+        self.image_obs_keys = image_obs_keys or []
         self.render_hw = render_hw
         self.render_camera = render_camera
 
-        self._env = OffScreenRenderEnv(
+        use_images = obs_type == "image" and bool(self.image_obs_keys)
+        camera_names = [_IMG_KEY_TO_CAMERA[k] for k in self.image_obs_keys if k in _IMG_KEY_TO_CAMERA]
+
+        self._env = ControlEnv(
             bddl_file_name=bddl_file,
             has_renderer=False,
-            has_offscreen_renderer=True,
-            render_camera=render_camera,
-            camera_names=[render_camera],
-            camera_heights=render_hw[0],
-            camera_widths=render_hw[1],
+            has_offscreen_renderer=use_images,
+            use_camera_obs=use_images,
+            camera_names=camera_names if use_images else [],
+            camera_heights=[128] * len(camera_names) if use_images else [],
+            camera_widths=[128] * len(camera_names) if use_images else [],
             control_freq=20,
         )
 
-        # Bootstrap obs shape by doing a reset
         raw_obs = self._env.reset()
-        flat_obs = self._flatten_obs(raw_obs)
-        obs_dim = flat_obs.shape[0]
         act_dim = self._env.env.action_dim
 
-        self.observation_space = Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
-        )
-        self.action_space = Box(low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
-        self._last_obs = flat_obs
+        if use_images:
+            flat_state = self._flatten_state(raw_obs)
+            state_dim = flat_state.shape[0]
+            spaces_dict = {"state": Box(low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32)}
+            for img_key in self.image_obs_keys:
+                spaces_dict[img_key] = Box(low=0.0, high=1.0, shape=(3, 128, 128), dtype=np.float32)
+            self.observation_space = gym.spaces.Dict(spaces_dict)
+        else:
+            flat_obs = self._flatten_state(raw_obs)
+            obs_dim = flat_obs.shape[0]
+            self.observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    def _flatten_obs(self, obs_dict: dict) -> np.ndarray:
+        self.action_space = Box(low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
+        self._last_obs = self._get_obs(raw_obs)
+
+    def _extract_state_key(self, obs_dict: dict, hdf5_key: str) -> np.ndarray:
+        """Extract a single HDF5-named state key from the live env obs dict."""
+        if hdf5_key not in _HDF5_KEY_TO_ENV:
+            return obs_dict[hdf5_key].astype(np.float32).ravel()
+        env_keys = _HDF5_KEY_TO_ENV[hdf5_key]
         parts = []
-        for key in self.obs_keys:
-            val = obs_dict[key]
+        for ek in env_keys:
+            val = obs_dict[ek].astype(np.float32)
+            if ek == "robot0_eef_quat" and hdf5_key in ("ee_ori", "ee_states"):
+                val = _quat_to_axisangle(val)
             if val.ndim == 0:
                 val = val[None]
-            parts.append(val.astype(np.float32))
+            parts.append(val.ravel())
+        return np.concatenate(parts)
+
+    def _flatten_state(self, obs_dict: dict) -> np.ndarray:
+        parts = [self._extract_state_key(obs_dict, k) for k in self.obs_keys]
         return np.concatenate(parts, axis=0)
 
-    # ------------------------------------------------------------------
+    def _get_image(self, obs_dict: dict, img_key: str) -> np.ndarray:
+        """Get image from env obs dict as float32 CHW in [0, 1]."""
+        cam = _IMG_KEY_TO_CAMERA.get(img_key, img_key)
+        # robosuite camera obs key format: "{camera_name}_image"
+        env_key = f"{cam}_image"
+        img = obs_dict[env_key]  # (H, W, C) uint8
+        return img.transpose(2, 0, 1).astype(np.float32) / 255.0  # (C, H, W)
+
+    def _get_obs(self, obs_dict: dict):
+        """Return obs in the correct format (flat array or dict)."""
+        state = self._flatten_state(obs_dict)
+        if self.obs_type == "image" and self.image_obs_keys:
+            result = {"state": state}
+            for img_key in self.image_obs_keys:
+                result[img_key] = self._get_image(obs_dict, img_key)
+            return result
+        return state
+
     def reset(self, seed=None, options=None):
         if seed is not None:
             self._env.seed(seed)
         raw_obs = self._env.reset()
-        self._last_obs = self._flatten_obs(raw_obs)
+        self._last_obs = self._get_obs(raw_obs)
+        return self._last_obs, {}
+
+    def set_init_state(self, init_state):
+        """Set a fixed MuJoCo initial state (for LIBERO-PRO evaluation)."""
+        raw_obs = self._env.set_init_state(init_state)
+        self._last_obs = self._get_obs(raw_obs)
         return self._last_obs, {}
 
     def step(self, action):
         raw_obs, reward, done, info = self._env.step(action)
-        obs = self._flatten_obs(raw_obs)
+        obs = self._get_obs(raw_obs)
         self._last_obs = obs
         success = bool(self._env.check_success())
         info["success"] = success
@@ -186,11 +248,15 @@ class LiberoGymWrapper(gym.Env):
         imgs = self._env.env.sim.render(
             height=h, width=w, camera_name=self.render_camera
         )
-        return imgs[::-1]  # flip vertically (MuJoCo convention)
+        return imgs[::-1]
 
     def seed(self, seed=None):
         if seed is not None:
-            self._env.seed(seed)
+            try:
+                self._env.seed(seed)
+            except TypeError:
+                # robosuite 1.5.x may not expose seed() on the env
+                np.random.seed(seed)
 
     def close(self):
         self._env.close()

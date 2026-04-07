@@ -61,13 +61,19 @@ def fit_all_embeddings(X: np.ndarray, n_components: int = 2):
 # ──────────────────────────────────────────────────────────────────────────────
 
 METHOD_COLORS = {
-    "baseline":         "#1f77b4",  # strong blue
-    "hierarchical_emb": "#ff7f0e",  # vivid orange
-    "flow_intent":      "#2ca02c",  # strong green
-    "flow_intent_emb":  "#17becf",  # teal
-    "intent_learned":   "#d62728",  # strong red
-    "intent_sequence":  "#8c564b",  # brown
-    "gt_demos":         "#e377c2",  # pink — distinct from policy variants
+    # MLP variants — saturated solid colors
+    "baseline":                  "#1f77b4",  # strong blue
+    "hierarchical_emb":          "#ff7f0e",  # vivid orange
+    "flow_intent":               "#2ca02c",  # strong green
+    "flow_intent_emb":           "#17becf",  # teal
+    "intent_learned":            "#d62728",  # strong red
+    "intent_sequence":           "#8c564b",  # brown
+    # ChiUNet variants — darker/muted tones to distinguish from MLP family
+    "baseline_chiunet":          "#6baed6",  # light steel blue
+    "hierarchical_emb_chiunet":  "#e6550d",  # burnt orange
+    "flow_intent_chiunet_action":"#756bb1",  # muted purple
+    # Other
+    "gt_demos":                  "#e377c2",  # pink — distinct from policy variants
 }
 
 def get_color(method: str, idx: int, n_methods: int):

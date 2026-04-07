@@ -58,9 +58,37 @@ from tensordict import TensorDict
 from mip.agent import TrainingAgent
 from mip.flow_intent_agent import FlowIntentAgent
 from mip.intent_predictor import IntentPredictor
-from mip.datasets.robomimic_dataset import make_dataset
-from mip.envs.robomimic.robomimic_env import make_vec_env
+from mip.datasets.robomimic_dataset import make_dataset as make_dataset_robomimic
+from mip.envs.robomimic.robomimic_env import make_vec_env as make_vec_env_robomimic
+from mip.datasets.kitchen_dataset import make_dataset as make_dataset_kitchen
+from mip.envs.kitchen import make_vec_env as make_vec_env_kitchen
+from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
+from mip.envs.libero import make_vec_env as make_vec_env_libero
 from mip.torch_utils import set_seed
+
+
+def _is_kitchen(task_config):
+    return "kitchen" in getattr(task_config, "env_name", "")
+
+
+def _is_libero(task_config):
+    return getattr(task_config, "env_name", "").startswith("libero")
+
+
+def make_vec_env(task_config, seed=0):
+    if _is_libero(task_config):
+        return make_vec_env_libero(task_config, seed=seed)
+    if _is_kitchen(task_config):
+        return make_vec_env_kitchen(task_config, seed=seed)
+    return make_vec_env_robomimic(task_config, seed=seed)
+
+
+def make_dataset(task_config):
+    if _is_libero(task_config):
+        return make_dataset_libero(task_config)
+    if _is_kitchen(task_config):
+        return make_dataset_kitchen(task_config)
+    return make_dataset_robomimic(task_config)
 
 
 STEER_K = 10  # intent samples for steerability
@@ -123,6 +151,23 @@ def setup_config_for_env(config, envs):
                 config.task.obs_dim = base_obs_dim + _cond_dim
     else:
         config.task.obs_dim = config.network.emb_dim
+        if (
+            _is_libero(config.task)
+            and getattr(config.task, "intent_conditioning", False)
+            and arch_variant != "flow_intent"
+            and isinstance(obs, dict)
+            and "state" in obs
+            and "shape_meta" in config.task
+            and "state" in config.task.shape_meta["obs"]
+        ):
+            intent_type = getattr(config.task, "intent_type", "mean")
+            cond_dim = (
+                getattr(config.task, "intent_emb_dim", 64)
+                if intent_type == "encoded_mean"
+                else config.task.intent_dim
+            )
+            base_state_dim = int(obs["state"].shape[-1])
+            config.task.shape_meta["obs"]["state"]["shape"] = [base_state_dim + cond_dim]
 
     return obs  # the reset obs, reuse to avoid re-reset
 
@@ -170,9 +215,8 @@ def _patch_config_from_checkpoint(checkpoint_path: str, config):
     # Don't touch network.emb_dim — it controls hidden dim, not just obs_dim
 
     config.task.horizon = Ta
-    # act_steps = horizon - (obs_steps - 1), capped at horizon
-    To = config.task.obs_steps
-    config.task.act_steps = min(Ta - (To - 1), Ta)
+    # Don't override act_steps — it's a deployment choice set in the yaml config,
+    # not an architecture constraint inferred from weights.
 
 
 def load_model(checkpoint_path: str, config, dataset, device: str):
@@ -308,8 +352,13 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
                 with torch.no_grad():
                     intent_proxy = intent_predictor(obs_t)  # (B, cond_dim)
             else:
-                intent_start = dataset.intent_start
-                intent_end = dataset.intent_end
+                intent_start = getattr(dataset, "intent_start", None)
+                intent_end = getattr(dataset, "intent_end", None)
+                if intent_start is None or intent_end is None:
+                    raise RuntimeError(
+                        "Intent CV proxy requires dataset.intent_start/end; "
+                        "provide an intent predictor or a dataset with intent indices."
+                    )
                 eef_now  = obs_t[:, -1, intent_start:intent_end]
                 eef_prev = obs_t[:, -2, intent_start:intent_end]
                 velocity = eef_now - eef_prev
@@ -331,12 +380,19 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
         obs_dict = {}
         for k, v in obs_raw.items():
             v_f = v.astype(np.float32)
-            v_norm = dataset.normalizer["obs"][k].normalize(v_f)
-            obs_dict[k] = torch.tensor(v_norm, device=device, dtype=torch.float32)
+            normalizer = dataset.normalizer["obs"].get(k, None)
+            if normalizer is not None:
+                v_f = normalizer.normalize(v_f)
+            obs_dict[k] = torch.tensor(v_f, device=device, dtype=torch.float32)
 
         # Lowdim tensor for intent proxy: concatenate all lowdim keys
-        lowdim_parts = [obs_dict[k] for k in dataset.lowdim_keys]
-        lowdim_t = torch.cat(lowdim_parts, dim=-1)  # (B, obs_steps, lowdim_dim)
+        lowdim_keys = list(getattr(dataset, "lowdim_keys", None) or ["state"])
+        lowdim_parts = [obs_dict[k] for k in lowdim_keys]
+        lowdim_t = (
+            torch.cat(lowdim_parts, dim=-1)
+            if len(lowdim_parts) > 1
+            else lowdim_parts[0]
+        )  # (B, obs_steps, lowdim_dim)
 
         if has_intent and arch_variant != "flow_intent":
             if intent_predictor is not None:
@@ -344,8 +400,13 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
                     intent_proxy = intent_predictor(lowdim_t)  # (B, cond_dim)
             else:
                 # CV proxy (only valid for non-encoded_mean types)
-                intent_start = dataset.intent_start
-                intent_end = dataset.intent_end
+                intent_start = getattr(dataset, "intent_start", None)
+                intent_end = getattr(dataset, "intent_end", None)
+                if intent_start is None or intent_end is None:
+                    raise RuntimeError(
+                        "Intent CV proxy requires dataset.intent_start/end; "
+                        "provide an intent predictor or a dataset with intent indices."
+                    )
                 eef_now  = lowdim_t[:, -1, intent_start:intent_end]
                 eef_prev = lowdim_t[:, -2, intent_start:intent_end]
                 velocity = eef_now - eef_prev
@@ -356,10 +417,15 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
                 -1, config.task.obs_steps, -1
             )  # (B, obs_steps, cond_dim)
             # PushT image: intent is concatenated into agent_pos (shape_meta specifies [4]).
+            # LIBERO image: intent is concatenated into obs["state"].
             # Robomimic image: intent is a separate lowdim key added to obs_dict.
             if getattr(config.task, "env_name", "") == "pusht":
                 obs_dict["agent_pos"] = torch.cat(
                     [obs_dict["agent_pos"], intent_expanded.contiguous()], dim=-1
+                )
+            elif _is_libero(config.task) and "state" in obs_dict:
+                obs_dict["state"] = torch.cat(
+                    [obs_dict["state"], intent_expanded.contiguous()], dim=-1
                 )
             else:
                 obs_dict["intent"] = intent_expanded.contiguous()
@@ -394,6 +460,7 @@ def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
     while n_done < n_rollouts:
         obs, _ = envs.reset()
         ep_reward = np.zeros(config.task.num_envs)
+        ep_success_flags = np.zeros(config.task.num_envs, dtype=bool)
         t = 0
         first_step = True
 
@@ -456,7 +523,26 @@ def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
             ep_reward += reward
             t += config.task.act_steps
 
-        ep_success.append(bool(ep_reward[0] > 0))
+            if "_final_info" in info and "final_info" in info:
+                for i in range(config.task.num_envs):
+                    if info["_final_info"][i]:
+                        final_info = info["final_info"][i]
+                        if final_info and "success" in final_info:
+                            ep_success_flags[i] = ep_success_flags[i] or bool(
+                                np.asarray(final_info["success"]).any()
+                            )
+            if "success" in info:
+                success_info = info["success"]
+                for i in range(config.task.num_envs):
+                    success_value = (
+                        success_info[i] if hasattr(success_info, "__len__") else success_info
+                    )
+                    ep_success_flags[i] = ep_success_flags[i] or bool(
+                        np.asarray(success_value).any()
+                    )
+
+        for i in range(config.task.num_envs):
+            ep_success.append(bool(ep_success_flags[i] or (ep_reward[i] > 0)))
         n_done += config.task.num_envs
 
     steer_actions = np.stack(steer_actions_list) if steer_actions_list else None
@@ -478,7 +564,9 @@ def collect_gt_demos(dataset, act_steps: int, obs_steps: int, max_samples: int =
     This matches exactly the slice used in collect_rollouts().
     """
     from torch.utils.data import DataLoader
-    loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=2, drop_last=False)
+    # Use a single worker so demo collection works in restricted sandboxed
+    # environments that do not permit the multiprocessing listener socket.
+    loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=0, drop_last=False)
     s = obs_steps - 1
     chunks = []
     for batch in loader:
@@ -573,14 +661,19 @@ Example:
         from mip.samplers import get_default_step_list
         _num_steps = int(get_default_step_list(config.optimization.loss_type)[0])
 
-        chunks, successes, steer_acts, steer_ints = collect_rollouts(
-            config, agent, dataset, envs,
-            n_rollouts=args.n_rollouts,
-            device=args.device,
-            is_flow_intent=is_fi,
-            intent_predictor=intent_predictor,
-            num_steps=_num_steps,
-        )
+        try:
+            chunks, successes, steer_acts, steer_ints = collect_rollouts(
+                config, agent, dataset, envs,
+                n_rollouts=args.n_rollouts,
+                device=args.device,
+                is_flow_intent=is_fi,
+                intent_predictor=intent_predictor,
+                num_steps=_num_steps,
+            )
+        except Exception as e:
+            print(f"[ERROR] Rollout failed for {label}: {e}")
+            envs.close()
+            continue
         envs.close()
 
         sr = np.mean(successes)

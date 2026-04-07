@@ -15,14 +15,16 @@ cd /home/ldahiya/max_vla/much-ado-about-noising
 source .venv/bin/activate
 
 python examples/collect_intent_outcomes.py \
-    --run "flow_intent:checkpoints/lift_mh_state_flow_mlp_512_h10_seed0_intent_flow_intent_emb_success94.pt:task=lift_mh_state_flow_intent_emb:+network.arch_variant=flow_intent" \
+    --run "flow_intent:checkpoints/lift_mh_state_flow_mlp_512_h10_seed0_intent_flow_intent_success100.pt:task=lift_mh_state_flow_intent:+network.arch_variant=flow_intent" \
     --n-rollouts 10 \
-    --n-critical 5 \
+    --n-critical 1 \
+    --max-timestep 80 \
     --n-intents 50 \
     --k-clusters 3 \
     --n-future-steps 80 \
     --n-trials 20 \
     --render \
+    --plot-intent-xyz \
     --device cuda \
     --out rollouts/lift_mh_state_intent_outcomes.pkl \
-    --out-dir rollouts/lift_mh_state_intent_outcomes_figs
+    --out-dir rollouts/tmp-lift_mh_state_intent_outcomes-1critical

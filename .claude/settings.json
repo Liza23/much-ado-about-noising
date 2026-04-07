@@ -1,11 +1,19 @@
 {
+  "env": {
+    "MAX_THINKING_TOKENS": "10000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "haiku"
+  },
   "permissions": {
     "allow": [
       "Bash(timeout 60 uv run:*)",
       "Read(//home/ldahiya/LIBERO/libero/libero/benchmark/**)",
       "Read(//home/ldahiya/LIBERO/libero/libero/envs/**)",
       "Read(//home/ldahiya/LIBERO/**)",
-      "Read(//home/ldahiya/LIBERO/libero/libero/**)"
+      "Read(//home/ldahiya/LIBERO/libero/libero/**)",
+      "Read(//home/ldahiya/LIBERO-PRO/libero/libero/benchmark/**)",
+      "Read(//home/ldahiya/LIBERO-PRO/libero/libero/**)"
     ]
-  }
+  },
+  "model": "sonnet"
 }

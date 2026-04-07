@@ -123,7 +123,7 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
                 obs_keys=task_config.obs_keys,
                 init_state=None,
                 render_hw=(256, 256),
-                render_camera_name="agentview",
+                render_camera_name=getattr(task_config, "render_camera_name", "agentview"),
             )
         else:  # image observation
             env = create_robomimic_env(

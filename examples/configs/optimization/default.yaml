@@ -9,7 +9,7 @@ norm_type: "l2" # "l1", "l2", "smooth_l1"
 lr: 1e-4
 weight_decay: 1e-5
 num_steps: 1
-sample_mode: "zero"
+sample_mode: "stochastic"
 t_two_step: 0.9
 discrete_dt: 0.01
 grad_clip_norm: 10.0

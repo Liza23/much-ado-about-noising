@@ -1,0 +1,64 @@
+# @package task
+defaults:
+  - _self_
+
+env_name: "libero_spatial"
+env_type: "image"
+obs_type: "image"
+abs_action: false
+
+dataset_path: null
+bddl_file: null
+
+# State obs keys (used for state portion of obs dict).
+obs_keys:
+  - ee_states
+  - gripper_states
+  - joint_states
+
+# Image obs keys (camera names in LIBERO HDF5 format).
+image_obs_keys:
+  - agentview_rgb
+  - eye_in_hand_rgb
+
+max_episode_steps: 600
+render_camera_name: "agentview"
+
+obs_steps: 2
+act_steps: 8
+horizon: 16
+num_envs: 5
+save_video: false
+val_dataset_percentage: 0.0
+
+act_dim: 7
+obs_dim: 256  # overridden at runtime to network.emb_dim
+
+# Image encoder settings
+resize_shape: null
+crop_shape:
+  - 76
+  - 76
+random_crop: true
+use_group_norm: true
+
+# Shape meta for MultiImageObsEncoder.
+# State vector = ee_states(6) + gripper_states(2) + joint_states(7) = 15D.
+shape_meta:
+  obs:
+    state:
+      shape:
+        - 15
+      type: low_dim
+    agentview_rgb:
+      shape:
+        - 3
+        - 128
+        - 128
+      type: rgb
+    eye_in_hand_rgb:
+      shape:
+        - 3
+        - 128
+        - 128
+      type: rgb
