@@ -1,0 +1,20 @@
+# @package task
+defaults:
+  - robomimic_base
+  - _self_
+
+env_name: "pen_grasp"
+obs_type: "state"
+env_type: "ph"
+
+# Dataset configuration -- update when pen_grasp demonstrations are collected
+dataset_filename: "robomimic/pen_grasp/ph/low_dim.hdf5"
+
+max_episode_steps: 500
+
+obs_keys: ["object", "robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
+
+# Required keys
+horizon: 16
+act_dim: 10
+obs_dim: 23
