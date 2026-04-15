@@ -1,0 +1,36 @@
+# @package task
+# LIBERO-Object suite — multi-task baseline (all 10 tasks, state observations)
+#
+# One policy trained on all 10 object tasks; eval averages success across all 10.
+# Matches the standard LIBERO benchmark protocol (Liu et al., 2023).
+defaults:
+  - libero_spatial_state
+  - _self_
+
+env_name: "libero_object"
+
+dataset_path: null
+dataset_paths:
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_bbq_sauce_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_butter_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_chocolate_pudding_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_cream_cheese_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_ketchup_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_milk_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_orange_juice_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_salad_dressing_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
+
+bddl_file: null
+bddl_files:
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_bbq_sauce_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_butter_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_chocolate_pudding_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_cream_cheese_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_ketchup_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_milk_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_orange_juice_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_salad_dressing_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_tomato_sauce_and_place_it_in_the_basket.bddl

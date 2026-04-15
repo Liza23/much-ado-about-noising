@@ -460,6 +460,62 @@ class FlowIntentAgent:
             return action, intent_vec
         return action
 
+    def sample_intent(self, obs: torch.Tensor, use_ema: bool = True, num_steps: int = -1) -> torch.Tensor:
+        """Sample an intent vector from the intent ODE given obs. Returns (B, intent_dim)."""
+        encoder = self.encoder_ema if use_ema else self.encoder
+        intent_flow = self.intent_flow_map_ema if use_ema else self.intent_flow_map
+        cfg = deepcopy(self.config.optimization)
+        if num_steps >= 1:
+            cfg.num_steps = int(num_steps)
+        if isinstance(obs, dict) or hasattr(obs, "keys"):
+            _first = next(iter(obs.values()))
+            B, device = _first.shape[0], _first.device
+        else:
+            B, device = obs.shape[0], obs.device
+        _eff_dim = (
+            getattr(self.config.task, "intent_emb_dim", self.config.task.intent_dim)
+            if self._intent_type == "encoded_mean"
+            else self.config.task.intent_dim
+        )
+        with torch.no_grad():
+            obs_emb = encoder(obs, None)
+            if obs_emb.dim() == 2:
+                obs_emb = obs_emb.unsqueeze(1)
+            intent_noise = torch.randn(B, 1, _eff_dim, device=device)
+            intent_sampled = self._run_intent_ode(cfg, intent_flow, obs_emb, intent_noise)
+        return intent_sampled.squeeze(1)  # (B, intent_dim)
+
+    def sample_given_intent(
+        self,
+        obs: torch.Tensor,
+        intent_vec: torch.Tensor,  # (B, intent_dim)
+        use_ema: bool = True,
+        num_steps: int = -1,
+    ) -> torch.Tensor:
+        """Decode action given a pre-sampled intent vector. Returns (B, horizon, act_dim)."""
+        encoder = self.encoder_ema if use_ema else self.encoder
+        action_dec = (None if self._use_chiunet_action
+                      else (self.action_decoder_ema if use_ema else self.action_decoder))
+        cfg = deepcopy(self.config.optimization)
+        if num_steps >= 1:
+            cfg.num_steps = int(num_steps)
+        with torch.no_grad():
+            obs_emb = encoder(obs, None)
+            if obs_emb.dim() == 2:
+                obs_emb = obs_emb.unsqueeze(1)
+            if self._use_chiunet_action:
+                intent_expanded = intent_vec.unsqueeze(1).expand(-1, self.config.task.obs_steps, -1)
+                action_condition = torch.cat([obs_emb, intent_expanded], dim=-1)
+                action_flow = self.action_flow_map_ema if use_ema else self.action_flow_map
+                action_noise = torch.randn(
+                    intent_vec.shape[0], self.config.task.horizon, self.config.task.act_dim,
+                    device=intent_vec.device,
+                )
+                action = self._run_action_ode(cfg, action_flow, action_condition, action_noise)
+            else:
+                action = action_dec(obs_emb, intent_vec)
+        return action
+
     def _run_intent_ode(
         self,
         cfg,

@@ -1,0 +1,20 @@
+# @package task
+# LIBERO Object suite — flow-intent Config A
+#
+# Same architecture as libero_spatial_state_flow_intent but for the Object
+# benchmark (different task names, same obs/action structure).
+defaults:
+  - libero_spatial_state
+  - _self_
+
+env_name: "libero_object"
+
+# Intent settings — 6D = ee_pos(3) + axis-angle(3)
+intent_conditioning: true
+intent_dim: 6
+intent_type: mean
+intent_predictor: false
+intent_horizon: 8
+intent_training_mode: independent
+intent_keys:
+  - ee_states

@@ -1,0 +1,56 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: mlp
+  - task: libero_object_state_flow_intent
+  - _self_
+
+mode: "train"
+
+# Override log settings for residual SAC
+log:
+  project: "residual_sac"
+  group: "default"
+  exp_name: "${task.env_name}_${task.env_type}_rsac_alpha${residual_sac.residual_alpha}_seed${optimization.seed}"
+  eval_freq: 10000
+  log_freq: 1000
+  save_freq: 50000
+  eval_episodes: 20
+  save_video: false
+
+# The network config must match what was used to pretrain the flow-intent model
+network:
+  arch_variant: flow_intent
+  num_layers: 8  # must match the pretrained checkpoint
+
+# Task-specific paths (override at runtime)
+task:
+  dataset_path: null   # e.g. ~/LIBERO/libero/datasets/libero_object/pick_up_the_chocolate_pudding_demo.hdf5
+  bddl_file: null      # e.g. ~/LIBERO/libero/bddl_files/libero_object/pick_up_the_chocolate_pudding.bddl
+
+# Residual SAC configuration
+residual_sac:
+  # Path to pretrained flow-intent checkpoint (REQUIRED)
+  flow_intent_ckpt: ""
+
+  # Residual composition: a_exec = clip(base + alpha * delta, -1, 1)
+  residual_alpha: 0.1
+  predict_a_exec: false  # true = actor predicts full action, false = predicts delta
+
+  # SAC hyperparameters
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  alpha_lr: 3e-4
+  hidden_dims: [256, 256, 256]
+  discount: 0.99
+  tau: 0.005
+  init_alpha: 0.1
+  target_entropy: "auto"  # "auto" = -act_dim_flat * 0.1
+  backup_entropy: true
+
+  # Training
+  total_env_steps: 1000000
+  warmup_steps: 5000          # random exploration before SAC updates
+  batch_size: 256
+  num_updates_per_step: 1     # gradient steps per env step
+  buffer_capacity: 1000000

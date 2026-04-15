@@ -59,8 +59,45 @@ from mip.datasets.kitchen_dataset import make_dataset as make_dataset_kitchen
 from mip.envs.kitchen import make_vec_env as make_vec_env_kitchen
 from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
 from mip.envs.libero import make_vec_env as make_vec_env_libero
+from mip.agent import TrainingAgent
 from robosuite.models.objects import MujocoXMLObject
 from sklearn.cluster import KMeans
+
+
+class BaselineAgentAdapter:
+    """Wraps TrainingAgent to provide a FlowIntentAgent-compatible interface.
+
+    The "intent" for a baseline model is the sampled action (flattened).
+    Fixed-intent rollout = repeat the same action chunk at every step.
+    This lets collect_intent_outcomes_image.py visualize baseline action diversity.
+    """
+
+    _is_baseline_adapter = True
+
+    def __init__(self, inner_agent, config):
+        self._inner = inner_agent
+        self._config = config
+        self.encoder_ema = inner_agent.encoder_ema
+
+    def sample(self, obs, use_ema=True, num_steps=9, return_intent=False):
+        B = obs.shape[0]
+        horizon = self._config.task.horizon
+        act_dim = self._config.task.act_dim
+        device = obs.device
+        sample_mode = getattr(self._config.optimization, "sample_mode", "stochastic")
+        if sample_mode == "zero":
+            act_0 = torch.zeros(B, horizon, act_dim, device=device)
+        else:
+            act_0 = torch.randn(B, horizon, act_dim, device=device)
+        act = self._inner.sample(act_0, obs, use_ema=use_ema, num_steps=num_steps)
+        if return_intent:
+            iv = act.reshape(B, -1).clone()
+            return act, iv
+        return act
+
+    def eval(self):
+        self._inner.eval()
+        return self
 
 
 def _is_kitchen(config):
@@ -402,8 +439,21 @@ def sample_intents(obs_buf, agent, config, dataset, device, n=50, num_steps=9):
 
 
 def decode_fixed_intent(obs_buf, fixed_intent, agent, config, dataset, device):
-    """Bypass ODE — encode obs then decode action with a fixed intent centroid."""
+    """Bypass ODE — encode obs then decode action with a fixed intent centroid.
+
+    For baseline adapters: fixed_intent is a flattened action chunk.  It is
+    reshaped back to (1, horizon, act_dim) and returned directly (the robot
+    repeats this chunk regardless of current obs).
+    """
     fi_obs, lowdim_t = to_fi_obs(obs_buf, config, dataset, device)
+    if getattr(agent, "_is_baseline_adapter", False):
+        # Baseline: fixed_intent is the flattened action → reshape and return directly
+        horizon = config.task.horizon
+        act_dim = config.task.act_dim
+        act_norm = torch.tensor(
+            fixed_intent, device=lowdim_t.device, dtype=torch.float32
+        ).unsqueeze(0).reshape(1, horizon, act_dim)
+        return dataset.normalizer["action"].unnormalize(act_norm.cpu().numpy())
     intent_t = torch.tensor(fixed_intent, device=device, dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
         obs_emb = agent.encoder_ema(fi_obs, None)
@@ -1311,6 +1361,12 @@ def main():
     # Load model
     agent, _ = load_model(ckpt_path, config, dataset, args.device)
     agent.eval()
+
+    # Wrap baseline (TrainingAgent) to expose FlowIntentAgent-compatible interface.
+    # The "intent" for a baseline is the sampled action (flattened); clustering it
+    # reveals whether the model exhibits multi-modal action distributions.
+    if isinstance(agent, TrainingAgent):
+        agent = BaselineAgentAdapter(agent, config)
 
     print(f"Task: {config.task.env_name}  obs_type: {config.task.obs_type}  "
           f"intent_dim: {getattr(config.task, 'intent_dim', '?')}")

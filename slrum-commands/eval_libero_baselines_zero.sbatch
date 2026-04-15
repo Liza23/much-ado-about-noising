@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=eval-libero-bl
-#SBATCH --output=logs/eval_libero_baselines_%j.out
-#SBATCH --error=logs/eval_libero_baselines_%j.err
+#SBATCH --job-name=eval-bl-zero
+#SBATCH --output=logs/eval_libero_baselines_zero_%j.out
+#SBATCH --error=logs/eval_libero_baselines_zero_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -41,4 +41,4 @@ python examples/eval_success_rate.py \
     --run "soup_baseline:${SOUP_CKPT}:task=libero_spatial_state:task.dataset_path=${SOUP_DS}:task.bddl_file=${SOUP_BDDL}" \
     --num-steps 1 \
     --n-rollouts 50 \
-    --out results/libero_baselines_eval.csv
+    --out results/libero_baselines_eval_zero.csv

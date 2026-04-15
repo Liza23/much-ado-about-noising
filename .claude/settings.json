@@ -12,7 +12,8 @@
       "Read(//home/ldahiya/LIBERO/**)",
       "Read(//home/ldahiya/LIBERO/libero/libero/**)",
       "Read(//home/ldahiya/LIBERO-PRO/libero/libero/benchmark/**)",
-      "Read(//home/ldahiya/LIBERO-PRO/libero/libero/**)"
+      "Read(//home/ldahiya/LIBERO-PRO/libero/libero/**)",
+      "Bash(find /data/user_data/ldahiya/libero-train/libero-*-suite-image -name \"wandb-summary.json\" -type f)"
     ]
   },
   "model": "sonnet"

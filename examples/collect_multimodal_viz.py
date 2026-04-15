@@ -347,7 +347,15 @@ def _run_append(args):
             continue
 
         print(f"\n{'=' * 60}\nAppending: {label}  |  ckpt: {ckpt_path}\n{'=' * 60}")
-        overrides = user_overrides + [
+        # Extract flow_intent_ckpt= from overrides (not a Hydra key)
+        fi_ckpt = None
+        hydra_overrides = []
+        for ov in user_overrides:
+            if ov.startswith("flow_intent_ckpt="):
+                fi_ckpt = ov.split("=", 1)[1]
+            else:
+                hydra_overrides.append(ov)
+        overrides = hydra_overrides + [
             f"optimization.device={args.device}",
             "task.num_envs=1",
             f"optimization.seed={args.seed}",
@@ -358,7 +366,8 @@ def _run_append(args):
         dataset = make_dataset(config.task)
 
         try:
-            agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device)
+            agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device,
+                                                  flow_intent_ckpt=fi_ckpt)
         except Exception as e:
             print(f"[ERROR] Failed to load {label}: {e}")
             envs.close()
@@ -522,7 +531,15 @@ def main():
         print(f"Label: {label}  |  ckpt: {ckpt_path}")
         print(f"{'=' * 60}")
 
-        overrides = user_overrides + [
+        # Extract flow_intent_ckpt= from overrides (not a Hydra key)
+        fi_ckpt = None
+        hydra_overrides = []
+        for ov in user_overrides:
+            if ov.startswith("flow_intent_ckpt="):
+                fi_ckpt = ov.split("=", 1)[1]
+            else:
+                hydra_overrides.append(ov)
+        overrides = hydra_overrides + [
             f"optimization.device={args.device}",
             "task.num_envs=1",
             f"optimization.seed={args.seed}",
@@ -533,7 +550,8 @@ def main():
         dataset = make_dataset(config.task)
 
         try:
-            agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device)
+            agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device,
+                                                  flow_intent_ckpt=fi_ckpt)
         except Exception as e:
             print(f"[ERROR] Failed to load {label}: {e}")
             envs.close()

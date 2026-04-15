@@ -269,7 +269,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
             eval_history.append(metrics.copy())
             avg_metrics = compute_average_metrics(eval_history)
 
-            primary_key = f"mean_success_{num_steps_list[0]}"
+            primary_key = f"mean_success_{num_steps_list[-1]}"
             if primary_key in metrics:
                 is_new_best = (
                     primary_key not in old_best
@@ -279,8 +279,11 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                     success_rate = metrics[primary_key]
                     loguru.logger.info(f"New best! {primary_key} = {success_rate:.4f}")
                     logger.save_agent(agent=agent, identifier="best")
+                    env_name_for_ckpt = config.task.env_name
+                    if len(list(getattr(config.task, "bddl_files", None) or [])) > 1:
+                        env_name_for_ckpt += "_suite"
                     ckpt_name = (
-                        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
+                        f"{env_name_for_ckpt}_{config.task.env_type}_{config.task.obs_type}_"
                         f"{config.optimization.loss_type}_{config.network.network_type}_"
                         f"{config.network.emb_dim}_seed{config.optimization.seed}"
                     )
@@ -323,145 +326,198 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                 intent_encoder.train()
 
 
+def _run_eval_episodes(config, eval_envs, dataset, agent, num_steps,
+                       intent_predictor, arch_variant, intent_conditioning,
+                       obs_type, image_obs_keys):
+    """Run eval episodes on already-constructed eval_envs. Returns (rewards, steps, successes)."""
+    episode_rewards = []
+    episode_steps = []
+    episode_success = []
+    for eval_batch_idx in range(config.log.eval_episodes // config.task.num_envs):
+        ep_reward = [0.0] * config.task.num_envs
+        success = [0] * config.task.num_envs
+        obs, _ = eval_envs.reset()
+        t = 0
+
+        while t < config.task.max_episode_steps:
+            if obs_type == "image":
+                obs_dict = {}
+                obs_dict["state"] = torch.tensor(
+                    dataset.normalizer["obs"]["state"].normalize(obs["state"].astype(np.float32)),
+                    device=config.optimization.device, dtype=torch.float32,
+                )
+                for img_key in image_obs_keys:
+                    obs_dict[img_key] = torch.tensor(
+                        obs[img_key].astype(np.float32),
+                        device=config.optimization.device, dtype=torch.float32,
+                    )
+                obs_tensor = TensorDict(obs_dict, batch_size=config.task.num_envs)
+                if intent_conditioning and arch_variant != "flow_intent":
+                    if intent_predictor is not None:
+                        with torch.no_grad():
+                            intent_proxy = intent_predictor(obs_tensor["state"])
+                    else:
+                        raise RuntimeError(
+                            "LIBERO eval requires intent_predictor for Config B image mode."
+                        )
+                    intent_expanded = intent_proxy.unsqueeze(1).expand(
+                        -1, config.task.obs_steps, -1
+                    )
+                    augmented_state = torch.cat(
+                        [obs_tensor["state"], intent_expanded.contiguous()], dim=-1
+                    )
+                    obs_tensor = TensorDict(
+                        {**{k: obs_tensor[k] for k in obs_tensor.keys()}, "state": augmented_state},
+                        batch_size=config.task.num_envs,
+                    )
+            else:
+                obs = obs.astype(np.float32)
+                obs = dataset.normalizer["obs"]["state"].normalize(obs)
+                obs_tensor = torch.tensor(
+                    obs, device=config.optimization.device, dtype=torch.float32
+                )
+                if intent_conditioning and arch_variant != "flow_intent":
+                    if intent_predictor is not None:
+                        with torch.no_grad():
+                            intent_proxy = intent_predictor(obs_tensor)
+                    else:
+                        raise RuntimeError(
+                            "LIBERO eval requires intent_predictor for Config B."
+                        )
+                    intent_expanded = intent_proxy.unsqueeze(1).expand(
+                        -1, config.task.obs_steps, -1
+                    )
+                    obs_tensor = torch.cat([obs_tensor, intent_expanded], dim=-1)
+
+            if arch_variant == "flow_intent":
+                with torch.no_grad():
+                    act_normed = agent.sample(
+                        obs=obs_tensor, use_ema=True, num_steps=num_steps,
+                    )
+            else:
+                act_0 = torch.randn(
+                    (config.task.num_envs, config.task.horizon, config.task.act_dim),
+                    device=config.optimization.device,
+                )
+                with torch.no_grad():
+                    act_normed = agent.sample(
+                        act_0=act_0,
+                        obs=obs_tensor if obs_type == "image" else {"state": obs_tensor},
+                        num_steps=num_steps,
+                        use_ema=True,
+                    )
+
+            act_normed = act_normed.detach().cpu().numpy()
+            act = dataset.normalizer["action"].unnormalize(act_normed)
+
+            start = config.task.obs_steps - 1
+            end = start + config.task.act_steps
+            act = act[:, start:end, :]
+
+            obs, reward, terminated, truncated, info = eval_envs.step(act)
+            ep_reward = [ep_reward[i] + reward[i] for i in range(config.task.num_envs)]
+            t += config.task.act_steps
+
+            # Check success at every step: successful envs auto-reset (Gymnasium
+            # vector env behavior), so terminal success is in _final_info, not
+            # in the current-step info.
+            if "_final_info" in info:
+                for i in range(config.task.num_envs):
+                    if info["_final_info"][i]:
+                        fi = info["final_info"][i]
+                        if fi and "success" in fi:
+                            s = fi["success"]
+                            success[i] = max(success[i], int(bool(np.asarray(s).any())))
+            if "success" in info:
+                for i in range(config.task.num_envs):
+                    s = info["success"][i] if hasattr(info["success"], "__len__") else info["success"]
+                    success[i] = max(success[i], int(bool(np.asarray(s).any())))
+
+        episode_rewards.append(ep_reward)
+        episode_steps.append(t)
+        episode_success.append(success)
+
+        if (eval_batch_idx + 1) % max(1, (config.log.eval_episodes // config.task.num_envs) // 5) == 0:
+            loguru.logger.info(
+                f"Eval progress Nstep={num_steps}: "
+                f"{eval_batch_idx + 1}/{config.log.eval_episodes // config.task.num_envs} batches"
+            )
+    return episode_rewards, episode_steps, episode_success
+
+
 def evaluate(config: Config, envs, dataset, agent, logger, num_steps: int = 1,
              intent_predictor=None, arch_variant="flow_action"):
     intent_conditioning = getattr(config.task, "intent_conditioning", False)
     obs_type = getattr(config.task, "obs_type", "state")
     image_obs_keys = list(getattr(config.task, "image_obs_keys", None) or [])
-    episode_rewards = []
-    episode_steps = []
-    episode_success = []
-    # Recreate eval envs each call. The long-lived LIBERO image envs have been
-    # observed to stall after several eval cycles, leaving jobs "running" but
-    # stuck inside evaluation for hours.
-    eval_envs = make_vec_env(config.task, seed=config.optimization.seed + 1000 + num_steps)
-    try:
-        for eval_batch_idx in range(config.log.eval_episodes // config.task.num_envs):
-            ep_reward = [0.0] * config.task.num_envs
-            success = [0] * config.task.num_envs
-            obs, _ = eval_envs.reset()
-            t = 0
 
-            while t < config.task.max_episode_steps:
-                if obs_type == "image":
-                    # obs is a dict: {"state": (N, To, state_dim), img_key: (N, To, C, H, W), ...}
-                    obs_dict = {}
-                    obs_dict["state"] = torch.tensor(
-                        dataset.normalizer["obs"]["state"].normalize(obs["state"].astype(np.float32)),
-                        device=config.optimization.device, dtype=torch.float32,
-                    )
-                    for img_key in image_obs_keys:
-                        obs_dict[img_key] = torch.tensor(
-                            obs[img_key].astype(np.float32),
-                            device=config.optimization.device, dtype=torch.float32,
-                        )
-                    obs_tensor = TensorDict(obs_dict, batch_size=config.task.num_envs)
-                    # Config B image mode: inject predicted intent into obs["state"]
-                    if intent_conditioning and arch_variant != "flow_intent":
-                        if intent_predictor is not None:
-                            with torch.no_grad():
-                                intent_proxy = intent_predictor(obs_tensor["state"])
-                        else:
-                            raise RuntimeError(
-                                "LIBERO eval requires intent_predictor for Config B image mode."
-                            )
-                        intent_expanded = intent_proxy.unsqueeze(1).expand(
-                            -1, config.task.obs_steps, -1
-                        )
-                        augmented_state = torch.cat(
-                            [obs_tensor["state"], intent_expanded.contiguous()], dim=-1
-                        )
-                        obs_tensor = TensorDict(
-                            {**{k: obs_tensor[k] for k in obs_tensor.keys()}, "state": augmented_state},
-                            batch_size=config.task.num_envs,
-                        )
-                else:
-                    obs = obs.astype(np.float32)
-                    obs = dataset.normalizer["obs"]["state"].normalize(obs)
-                    obs_tensor = torch.tensor(
-                        obs, device=config.optimization.device, dtype=torch.float32
-                    )
+    bddl_files = list(getattr(config.task, "bddl_files", None) or [])
 
-                    # Intent conditioning at eval (state mode only)
-                    if intent_conditioning and arch_variant != "flow_intent":
-                        if intent_predictor is not None:
-                            with torch.no_grad():
-                                intent_proxy = intent_predictor(obs_tensor)
-                        else:
-                            raise RuntimeError(
-                                "LIBERO eval requires intent_predictor for Config B."
-                            )
-                        intent_expanded = intent_proxy.unsqueeze(1).expand(
-                            -1, config.task.obs_steps, -1
-                        )
-                        obs_tensor = torch.cat([obs_tensor, intent_expanded], dim=-1)
-
-                if arch_variant == "flow_intent":
-                    with torch.no_grad():
-                        act_normed = agent.sample(
-                            obs=obs_tensor, use_ema=True, num_steps=num_steps,
-                        )
-                else:
-                    act_0 = torch.randn(
-                        (config.task.num_envs, config.task.horizon, config.task.act_dim),
-                        device=config.optimization.device,
-                    )
-                    with torch.no_grad():
-                        act_normed = agent.sample(
-                            act_0=act_0,
-                            obs=obs_tensor if obs_type == "image" else {"state": obs_tensor},
-                            num_steps=num_steps,
-                            use_ema=True,
-                        )
-
-                act_normed = act_normed.detach().cpu().numpy()
-                act = dataset.normalizer["action"].unnormalize(act_normed)
-
-                start = config.task.obs_steps - 1
-                end = start + config.task.act_steps
-                act = act[:, start:end, :]
-
-                obs, reward, terminated, truncated, info = eval_envs.step(act)
-                ep_reward = [ep_reward[i] + reward[i] for i in range(config.task.num_envs)]
-                t += config.task.act_steps
-
-                # Check success at every step: successful envs auto-reset (Gymnasium
-                # vector env behavior), so terminal success is in _final_info, not
-                # in the current-step info.
-                if "_final_info" in info:
-                    for i in range(config.task.num_envs):
-                        if info["_final_info"][i]:
-                            fi = info["final_info"][i]
-                            if fi and "success" in fi:
-                                s = fi["success"]
-                                success[i] = max(success[i], int(bool(np.asarray(s).any())))
-                if "success" in info:
-                    for i in range(config.task.num_envs):
-                        s = info["success"][i] if hasattr(info["success"], "__len__") else info["success"]
-                        success[i] = max(success[i], int(bool(np.asarray(s).any())))
-
-            episode_rewards.append(ep_reward)
-            episode_steps.append(t)
-            episode_success.append(success)
-
-            if (eval_batch_idx + 1) % max(1, (config.log.eval_episodes // config.task.num_envs) // 5) == 0:
-                loguru.logger.info(
-                    f"Eval progress Nstep={num_steps}: "
-                    f"{eval_batch_idx + 1}/{config.log.eval_episodes // config.task.num_envs} batches"
+    if bddl_files:
+        # Multi-task eval: run episodes on each task, average success across tasks.
+        all_rewards, all_steps, all_success = [], [], []
+        per_task_success = {}
+        for bddl_file in bddl_files:
+            task_name = os.path.splitext(os.path.basename(bddl_file))[0]
+            config.task.bddl_file = bddl_file
+            eval_envs = make_vec_env(
+                config.task, seed=config.optimization.seed + 1000 + num_steps
+            )
+            try:
+                r, s, succ = _run_eval_episodes(
+                    config, eval_envs, dataset, agent, num_steps,
+                    intent_predictor, arch_variant, intent_conditioning,
+                    obs_type, image_obs_keys,
                 )
-    finally:
-        eval_envs.close()
+            finally:
+                eval_envs.close()
+            task_success = float(np.nanmean(succ))
+            per_task_success[task_name] = task_success
+            loguru.logger.info(f"  [{task_name}] success={task_success:.3f}")
+            all_rewards.extend(r)
+            all_steps.extend(s)
+            all_success.extend(succ)
 
-    mean_success = float(np.nanmean(episode_success))
-    loguru.logger.info(
-        f"Nstep={num_steps} | mean_reward={np.nanmean(episode_rewards):.3f} | "
-        f"mean_success={mean_success:.3f}"
-    )
-    return {
-        f"mean_step_{num_steps}": float(np.nanmean(episode_steps)),
-        f"mean_reward_{num_steps}": float(np.nanmean(episode_rewards)),
-        f"mean_success_{num_steps}": mean_success,
-    }
+        mean_success = float(np.nanmean(all_success))
+        loguru.logger.info(
+            f"Nstep={num_steps} | suite mean_success={mean_success:.3f} "
+            f"(over {len(bddl_files)} tasks)"
+        )
+        metrics = {
+            f"mean_step_{num_steps}": float(np.nanmean(all_steps)),
+            f"mean_reward_{num_steps}": float(np.nanmean(all_rewards)),
+            f"mean_success_{num_steps}": mean_success,
+        }
+        for task_name, s in per_task_success.items():
+            metrics[f"task_success_{num_steps}/{task_name}"] = s
+        return metrics
+    else:
+        # Single-task eval (original behavior).
+        # Recreate eval envs each call. The long-lived LIBERO image envs have been
+        # observed to stall after several eval cycles, leaving jobs "running" but
+        # stuck inside evaluation for hours.
+        eval_envs = make_vec_env(
+            config.task, seed=config.optimization.seed + 1000 + num_steps
+        )
+        try:
+            episode_rewards, episode_steps, episode_success = _run_eval_episodes(
+                config, eval_envs, dataset, agent, num_steps,
+                intent_predictor, arch_variant, intent_conditioning,
+                obs_type, image_obs_keys,
+            )
+        finally:
+            eval_envs.close()
+
+        mean_success = float(np.nanmean(episode_success))
+        loguru.logger.info(
+            f"Nstep={num_steps} | mean_reward={np.nanmean(episode_rewards):.3f} | "
+            f"mean_success={mean_success:.3f}"
+        )
+        return {
+            f"mean_step_{num_steps}": float(np.nanmean(episode_steps)),
+            f"mean_reward_{num_steps}": float(np.nanmean(episode_rewards)),
+            f"mean_success_{num_steps}": mean_success,
+        }
 
 
 @hydra.main(version_base=None, config_path="configs/", config_name="main")
@@ -478,6 +534,11 @@ def main(config):
 
     obs_type = getattr(config.task, "obs_type", "state")
     config.task.save_video = config.log.save_video
+    # For suite configs, bddl_file is null but bddl_files lists all tasks.
+    # Use the first task's bddl_file to initialize the env (just for obs shape).
+    bddl_files = list(getattr(config.task, "bddl_files", None) or [])
+    if not config.task.bddl_file and bddl_files:
+        config.task.bddl_file = bddl_files[0]
     envs = make_vec_env(config.task, seed=config.optimization.seed)
     obs, _ = envs.reset()
 
@@ -568,8 +629,11 @@ def main(config):
         loguru.logger.info(f"Loading model from {config.optimization.model_path}")
         resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
     elif config.mode == "train" and config.optimization.auto_resume:
+        env_name_for_ckpt = config.task.env_name
+        if len(list(getattr(config.task, "bddl_files", None) or [])) > 1:
+            env_name_for_ckpt += "_suite"
         ckpt_name = (
-            f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
+            f"{env_name_for_ckpt}_{config.task.env_type}_{config.task.obs_type}_"
             f"{config.optimization.loss_type}_{config.network.network_type}_"
             f"{config.network.emb_dim}_seed{config.optimization.seed}"
         )

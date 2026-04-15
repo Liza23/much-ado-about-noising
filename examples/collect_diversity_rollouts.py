@@ -65,6 +65,7 @@ from mip.envs.kitchen import make_vec_env as make_vec_env_kitchen
 from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
 from mip.envs.libero import make_vec_env as make_vec_env_libero
 from mip.torch_utils import set_seed
+from mip.residual_parl.parl_agent import ResidualPARLAgent, PARLConfig
 
 
 def _is_kitchen(task_config):
@@ -219,7 +220,64 @@ def _patch_config_from_checkpoint(checkpoint_path: str, config):
     # not an architecture constraint inferred from weights.
 
 
-def load_model(checkpoint_path: str, config, dataset, device: str):
+class ResidualPARLWrapper:
+    """Wraps FlowIntentAgent + ResidualPARLAgent behind the FlowIntentAgent .sample() interface.
+
+    Sampling path (mirrors is_flow_intent=True):
+        1. flow_intent.sample(obs, return_intent=True) → (base_actions, intent_vec)
+        2. parl.sample_action(obs_flat, base_chunk_flat, deterministic=True) → a_exec per env
+        3. Compose: replace act_steps slice in base_actions with PARL output, return full horizon tensor.
+    """
+
+    def __init__(self, flow_intent: FlowIntentAgent, parl: ResidualPARLAgent, config):
+        self.flow_intent = flow_intent
+        self.parl = parl
+        self.config = config
+
+    def eval(self):
+        self.flow_intent.eval()
+        return self
+
+    def sample(self, obs=None, use_ema: bool = True, num_steps: int = -1,
+               return_intent: bool = False, **kwargs):
+        """obs: (B, obs_steps, obs_dim) tensor — same as FlowIntentAgent.sample()."""
+        base_actions, intent_vec = self.flow_intent.sample(
+            obs=obs, use_ema=use_ema, num_steps=num_steps, return_intent=True
+        )
+        # base_actions: (B, horizon, act_dim) normalized
+
+        B = base_actions.shape[0]
+        s = self.config.task.obs_steps - 1
+        act_steps = self.config.task.act_steps
+
+        # Extract act_steps chunk and flatten for PARL
+        base_chunk = base_actions[:, s:s + act_steps, :]           # (B, act_steps, act_dim)
+        base_flat_np = base_chunk.reshape(B, -1).cpu().numpy()      # (B, act_steps*act_dim)
+        obs_flat_np = obs.reshape(B, -1).cpu().numpy()              # (B, obs_steps*obs_dim)
+
+        composed_list = []
+        for i in range(B):
+            a_exec, _, _ = self.parl.sample_action(
+                obs_flat_np[i], base_flat_np[i], deterministic=True
+            )
+            composed_list.append(a_exec)
+        composed_flat = np.stack(composed_list)                     # (B, act_steps*act_dim)
+
+        composed_chunk = torch.tensor(
+            composed_flat, device=base_actions.device, dtype=base_actions.dtype
+        ).reshape(B, act_steps, -1)                                 # (B, act_steps, act_dim)
+
+        # Embed back into full horizon
+        composed_full = base_actions.clone()
+        composed_full[:, s:s + act_steps, :] = composed_chunk
+
+        if return_intent:
+            return composed_full, intent_vec
+        return composed_full
+
+
+def load_model(checkpoint_path: str, config, dataset, device: str,
+               flow_intent_ckpt: str | None = None):
     """Load agent and (if needed) intent predictor from checkpoint.
 
     Returns:
@@ -235,6 +293,36 @@ def load_model(checkpoint_path: str, config, dataset, device: str):
     For image obs the CV proxy is not valid for encoded_mean, so we raise if
     the predictor is required but the sidecar is missing.
     """
+    # Detect PARL checkpoint by its state-dict keys before patching config.
+    _probe = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(_probe, dict) and "actor" in _probe and "critic" in _probe:
+        if flow_intent_ckpt is None:
+            raise ValueError(
+                "PARL checkpoint detected but flow_intent_ckpt not provided. "
+                "Pass flow_intent_ckpt=... in the run spec."
+            )
+        # Patch config from the flow_intent checkpoint (sets obs_dim etc.)
+        _patch_config_from_checkpoint(flow_intent_ckpt, config)
+        # Load frozen flow-intent backbone
+        fi_agent = FlowIntentAgent(config)
+        fi_agent.load(flow_intent_ckpt, load_optimizer=False)
+        fi_agent.eval()
+
+        # Build PARL agent with default hyperparams
+        obs_dim_per_step = dataset[0]["obs"]["state"].shape[-1]
+        obs_dim_flat = config.task.obs_steps * obs_dim_per_step
+        act_dim = config.task.act_dim
+        act_steps = config.task.act_steps
+        parl_config = PARLConfig(device=device)
+        parl_agent = ResidualPARLAgent(
+            parl_config, obs_dim=obs_dim_flat, act_dim=act_dim, query_freq=act_steps
+        )
+        parl_agent.set_flow_intent(fi_agent)
+        parl_agent.load(checkpoint_path)
+
+        wrapper = ResidualPARLWrapper(fi_agent, parl_agent, config)
+        return wrapper, None
+
     _patch_config_from_checkpoint(checkpoint_path, config)
     arch_variant = getattr(config.network, "arch_variant", "flow_action")
     if arch_variant == "flow_intent":

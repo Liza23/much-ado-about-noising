@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=libero-pudding-fi
-#SBATCH --output=logs/libero_pudding_state_flow_intent_%j.out
-#SBATCH --error=logs/libero_pudding_state_flow_intent_%j.err
+#SBATCH --job-name=libero-pudding-rsac
+#SBATCH --output=logs/libero_pudding_residual_sac_%j.out
+#SBATCH --error=logs/libero_pudding_residual_sac_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 
 set -euo pipefail
 
@@ -22,23 +22,28 @@ trap 'rm -rf "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR" "$XDG_RUNTIME_DIR"' EXIT
 TASK_NAME="pick_up_the_chocolate_pudding_and_place_it_in_the_basket"
 DATASET_PATH="/home/ldahiya/LIBERO/libero/datasets/libero_object/${TASK_NAME}_demo.hdf5"
 BDDL_FILE="/home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/${TASK_NAME}.bddl"
+FLOW_INTENT_CKPT="/data/user_data/ldahiya/libero-train/libero-object-state-pudding/flow_intent/models/model_best.pt"
 
-python examples/train_libero.py \
-    task=libero_spatial_state_flow_intent \
+python examples/train_residual_sac.py \
+    task=libero_object_state_flow_intent \
     network=mlp_flow_intent \
     task.dataset_path="${DATASET_PATH}" \
     task.bddl_file="${BDDL_FILE}" \
-    optimization.gradient_steps=300000 \
-    optimization.batch_size=256 \
-    optimization.loss_type=flow \
-    optimization.weight_decay=1e-4 \
+    residual_sac.flow_intent_ckpt="${FLOW_INTENT_CKPT}" \
+    residual_sac.residual_alpha=0.1 \
+    residual_sac.actor_lr=3e-4 \
+    residual_sac.critic_lr=3e-4 \
+    residual_sac.discount=0.99 \
+    residual_sac.batch_size=256 \
+    residual_sac.warmup_steps=5000 \
+    residual_sac.total_env_steps=1000000 \
+    residual_sac.num_updates_per_step=1 \
     log.eval_episodes=50 \
-    log.eval_freq=20000 \
+    log.eval_freq=10000 \
     log.save_freq=50000 \
     log.project=libero-experiments \
     log.group=libero-object-state-pudding \
-    log.exp_name=flow_intent \
-    log.log_dir="/data/user_data/ldahiya/libero-train/libero-object-state-pudding/flow_intent" \
+    log.exp_name=residual_sac \
+    log.log_dir="/data/user_data/ldahiya/libero-train/libero-object-state-pudding/residual_sac" \
     task.num_envs=5 \
-    optimization.auto_resume=false \
     log.save_video=false

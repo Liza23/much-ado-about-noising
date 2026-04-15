@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=libero-pudding-base
-#SBATCH --output=logs/libero_pudding_state_baseline_%j.out
-#SBATCH --error=logs/libero_pudding_state_baseline_%j.err
+#SBATCH --job-name=libero-spatial-suite-base
+#SBATCH --output=logs/libero_spatial_suite_state_baseline_%j.out
+#SBATCH --error=logs/libero_spatial_suite_state_baseline_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --requeue
+#SBATCH --time=48:00:00
 
 set -euo pipefail
 
@@ -19,25 +20,19 @@ export XDG_RUNTIME_DIR="$(mktemp -d /tmp/xdg_${SLURM_JOB_ID:-manual}_XXXXXX)"
 export MUJOCO_GL=egl
 trap 'rm -rf "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR" "$XDG_RUNTIME_DIR"' EXIT
 
-TASK_NAME="pick_up_the_chocolate_pudding_and_place_it_in_the_basket"
-DATASET_PATH="/home/ldahiya/LIBERO/libero/datasets/libero_object/${TASK_NAME}_demo.hdf5"
-BDDL_FILE="/home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/${TASK_NAME}.bddl"
-
 python examples/train_libero.py \
-    task=libero_spatial_state \
-    task.dataset_path="${DATASET_PATH}" \
-    task.bddl_file="${BDDL_FILE}" \
-    optimization.gradient_steps=300000 \
+    task=libero_spatial_suite_state \
+    optimization.gradient_steps=1000000 \
     optimization.batch_size=256 \
     optimization.loss_type=flow \
     optimization.weight_decay=1e-4 \
     log.eval_episodes=50 \
     log.eval_freq=20000 \
-    log.save_freq=50000 \
+    log.save_freq=100000 \
     log.project=libero-experiments \
-    log.group=libero-object-state-pudding \
+    log.group=libero-spatial-suite-state \
     log.exp_name=baseline \
-    log.log_dir="/data/user_data/ldahiya/libero-train/libero-object-state-pudding/baseline" \
+    log.log_dir="/data/user_data/ldahiya/libero-train/libero-spatial-suite-state/baseline" \
     task.num_envs=5 \
-    optimization.auto_resume=false \
+    optimization.auto_resume=true \
     log.save_video=false

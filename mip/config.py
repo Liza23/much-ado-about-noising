@@ -106,6 +106,10 @@ class TaskConfig:
     dataset_path: str | None = (
         None  # Local path (deprecated, use dataset_repo/dataset_filename)
     )
+    dataset_paths: list[str] | None = None  # Multiple local paths for multi-task suite training
+    bddl_file: str | None = None  # BDDL task file for LIBERO environments
+    bddl_files: list[str] | None = None  # Multiple BDDL files for suite-level multi-task eval
+    arch_variant: str = "flow_action"  # Architecture variant: "flow_action" or "flow_intent"
     max_episode_steps: int = 400
     obs_keys: list[str] = field(
         default_factory=lambda: [

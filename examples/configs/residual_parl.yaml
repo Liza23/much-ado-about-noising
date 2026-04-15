@@ -1,0 +1,64 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: mlp
+  - task: libero_10_state_flow_intent
+  - _self_
+
+mode: "train"
+
+# Override log settings for residual PARL
+log:
+  project: "residual_parl"
+  group: "default"
+  exp_name: "${task.env_name}_${task.env_type}_rparl_alpha${residual_parl.residual_alpha}_seed${optimization.seed}"
+  eval_freq: 10000
+  log_freq: 1000
+  save_freq: 50000
+  eval_episodes: 20
+  save_video: false
+
+# The network config must match what was used to pretrain the flow-intent model
+network:
+  arch_variant: flow_intent
+  num_layers: 8  # must match the pretrained checkpoint
+
+# Task-specific paths (override at runtime)
+task:
+  dataset_path: null
+  bddl_file: null
+
+# Residual PARL configuration
+residual_parl:
+  # Path to pretrained flow-intent checkpoint (REQUIRED)
+  flow_intent_ckpt: ""
+
+  # Residual composition: a_exec = clip(base + alpha * delta, -1, 1)
+  residual_alpha: 0.1
+  action_magnitude: 0.1    # bounds actor output to [-mag, mag] — keeps deltas small
+  predict_a_exec: false
+
+  # Network
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  hidden_dims: [256, 256, 256]
+  discount: 0.99
+  tau: 0.005
+
+  # PARL-specific: Best-of-N + Grad-Q + BC distillation
+  parl_num_samples: 16     # N — candidates from actor
+  parl_num_elites: 4       # K — top-Q elites kept
+  parl_num_grad_steps: 5   # gradient ascent steps on Q w.r.t. action
+  parl_step_size: 0.01     # step size for gradient ascent
+  critic_reduction: "min"  # "min" or "mean"
+
+  # Update ratios (more actor updates than critic)
+  num_critic_updates: 2
+  num_actor_updates: 4
+
+  # Training
+  total_env_steps: 1000000
+  warmup_steps: 5000
+  batch_size: 256
+  num_updates_per_step: 1
+  buffer_capacity: 1000000

@@ -88,6 +88,7 @@ def _make_single_env(task_config: TaskConfig, idx: int, render: bool = False, se
             obs_type=obs_type,
             image_obs_keys=image_obs_keys,
             render_camera=render_camera,
+            offscreen_render=render,
         )
 
         video_recorder = VideoRecorder.create_h264(
@@ -142,6 +143,7 @@ class LiberoGymWrapper(gym.Env):
         image_obs_keys: list[str] | None = None,
         render_hw: tuple[int, int] = (256, 256),
         render_camera: str = "agentview",
+        offscreen_render: bool = False,
     ):
         from libero.libero.envs.env_wrapper import ControlEnv
 
@@ -152,16 +154,21 @@ class LiberoGymWrapper(gym.Env):
         self.render_camera = render_camera
 
         use_images = obs_type == "image" and bool(self.image_obs_keys)
+        need_offscreen = use_images or offscreen_render
         camera_names = [_IMG_KEY_TO_CAMERA[k] for k in self.image_obs_keys if k in _IMG_KEY_TO_CAMERA]
+        # When rendering for state obs, use agentview (or configured camera) for render() calls.
+        render_cam_list = camera_names if use_images else ([render_camera] if offscreen_render else [])
+        render_heights = [128] * len(camera_names) if use_images else ([render_hw[0]] if offscreen_render else [])
+        render_widths = [128] * len(camera_names) if use_images else ([render_hw[1]] if offscreen_render else [])
 
         self._env = ControlEnv(
             bddl_file_name=bddl_file,
             has_renderer=False,
-            has_offscreen_renderer=use_images,
+            has_offscreen_renderer=need_offscreen,
             use_camera_obs=use_images,
-            camera_names=camera_names if use_images else [],
-            camera_heights=[128] * len(camera_names) if use_images else [],
-            camera_widths=[128] * len(camera_names) if use_images else [],
+            camera_names=render_cam_list,
+            camera_heights=render_heights,
+            camera_widths=render_widths,
             control_freq=20,
         )
 
@@ -220,10 +227,26 @@ class LiberoGymWrapper(gym.Env):
             return result
         return state
 
+    # Number of open-gripper warm-up steps applied after every reset.
+    # Needed because LIBERO resets to the robot's default joint config
+    # (gripper_qpos ≈ 0.021), but all demos start with the gripper fully
+    # open (gripper_qpos ≈ 0.036).  Without this the normalizer maps the
+    # reset observation into the "grasping" zone, causing the policy to
+    # predict close-gripper throughout evaluation.
+    _GRIPPER_WARMUP_STEPS: int = 10
+
     def reset(self, seed=None, options=None):
         if seed is not None:
             self._env.seed(seed)
         raw_obs = self._env.reset()
+        # Warm-up: send open-gripper actions to match the demo initial state.
+        open_action = np.zeros(self._env.env.action_dim, dtype=np.float32)
+        open_action[-1] = -1.0  # gripper convention: -1 = open
+        for _ in range(self._GRIPPER_WARMUP_STEPS):
+            raw_obs, _, done, _ = self._env.step(open_action)
+            if done:
+                raw_obs = self._env.reset()
+                break
         self._last_obs = self._get_obs(raw_obs)
         return self._last_obs, {}
 

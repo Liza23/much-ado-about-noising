@@ -70,6 +70,8 @@ def main():
     parser.add_argument("--n-rollouts", type=int, default=100,
                         help="Number of rollout episodes per variant")
     parser.add_argument("--out", required=True, help="Output CSV path")
+    parser.add_argument("--num-steps", type=int, default=None,
+                        help="ODE integration steps (default: 1 for flow, auto for others)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -116,10 +118,15 @@ def main():
 
         arch_variant = getattr(config.network, "arch_variant", "flow_action")
         is_fi = (arch_variant == "flow_intent")
-        num_steps = int(get_default_step_list(config.optimization.loss_type)[0])
+        if args.num_steps is not None:
+            num_steps = args.num_steps
+        else:
+            # Default to 1-step for flow (empirically best), auto for others
+            step_list = get_default_step_list(config.optimization.loss_type)
+            num_steps = int(step_list[-1])  # last = smallest = 1 for flow
 
         if not is_fi:
-            agent.config.optimization.sample_mode = "stochastic"
+            agent.config.optimization.sample_mode = "zero"
 
         print(f"  arch={arch_variant}  obs_type={config.task.obs_type}  "
               f"sample_mode={agent.config.optimization.sample_mode if not is_fi else 'randn(intent)'}  "
