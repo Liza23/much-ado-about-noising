@@ -218,15 +218,21 @@ def find_critical_states(config, agent, dataset, envs, args, device):
                 "variance": variance,
             })
 
-            # Advance with one free-sampling step (reuse probe_values[0] to avoid extra sample)
+            # Advance with one free-sampling step via undo_action to handle abs_action envs.
             with torch.no_grad():
                 act_norm = agent.sample(obs=fi_obs, use_ema=True, num_steps=num_steps)
             s = config.task.obs_steps - 1
             act_un = dataset.normalizer["action"].unnormalize(act_norm.cpu().numpy())
-            act_chunk = act_un[:, s:s + config.task.act_steps]
-            obs, _, terminated, truncated, _ = envs.step(act_chunk)
+            inner = _get_inner_step_env(envs, config)
+            done = False
+            for a_i in range(config.task.act_steps):
+                act = undo_action(act_un[0, s + a_i], config, dataset)
+                _, done, _ = _step_inner(inner, act)
+                if done:
+                    break
+            obs = update_obs_buf(obs, envs, config)
             t += config.task.act_steps
-            if terminated.any() or truncated.any():
+            if done:
                 break
 
         n_done += config.task.num_envs

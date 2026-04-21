@@ -214,6 +214,7 @@ class FlowIntentAgent:
         # the intent ODE at inference matches the training objective exactly.
         self.interpolant = Interpolant(config.optimization.interp_type)
         self._intent_loss_fn = get_loss_fn("flow")
+        self._decoder_train_step = 0  # incremented each update(); used for curriculum
 
         loguru.logger.info(
             "[FlowIntentAgent] Config-A agent ready. "
@@ -257,6 +258,7 @@ class FlowIntentAgent:
             dict with keys: "loss", "intent_loss", "action_loss"
         """
         cfg = self.config.optimization
+        self._decoder_train_step += 1
 
         # ── Step 1: flow intent loss ──────────────────────────────────────
         # Compute the intent target vector from the GT batch data.
@@ -305,6 +307,27 @@ class FlowIntentAgent:
         # intent_vec is detached for the same reason.
         with torch.no_grad():
             obs_emb = self.encoder(obs, None)  # (B, obs_steps, emb_dim)
+
+            # When decoder_uses_sampled_intent=True, replace GT intent with an
+            # ODE sample from the just-updated intent flow. This closes the
+            # train/eval gap: the decoder is trained on the same distribution it
+            # sees at inference. obs_emb is already no_grad here.
+            _curriculum_steps = getattr(self.config.task, "decoder_curriculum_steps", 0)
+            _past_curriculum = (
+                _curriculum_steps <= 0
+                or self._decoder_train_step > _curriculum_steps
+            )
+            if getattr(self.config.task, "decoder_uses_sampled_intent", False) and _past_curriculum:
+                _eff_dim = (
+                    getattr(self.config.task, "intent_emb_dim", self.config.task.intent_dim)
+                    if self._intent_type == "encoded_mean"
+                    else self.config.task.intent_dim
+                )
+                intent_noise = torch.randn(obs_emb.shape[0], 1, _eff_dim, device=obs_emb.device)
+                intent_sampled = self._run_intent_ode(
+                    cfg, self.intent_flow_map, obs_emb, intent_noise
+                )  # (B, 1, intent_dim)
+                intent_vec = intent_sampled.squeeze(1)  # (B, intent_dim)
 
         if self._use_chiunet_action:
             # Build condition: obs_emb ⊕ intent → (B, To, emb_dim + intent_dim)

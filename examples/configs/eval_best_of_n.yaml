@@ -1,0 +1,17 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: mlp
+  - task: libero_spatial_suite_state
+  - _self_
+
+mode: "eval"
+
+eval:
+  checkpoint: ""           # REQUIRED: path to policy checkpoint (.pt)
+  flow_intent_ckpt: ""     # REQUIRED only for PARL: path to flow-intent checkpoint
+  num_rollouts: 50         # episodes per task to estimate p_single
+  n_values: [1, 10, 50, 100, 500, 1000, 2000]
+  num_envs: 5              # parallel envs per task rollout
+  seed: 0
+  output_path: ""          # optional: save JSON results here

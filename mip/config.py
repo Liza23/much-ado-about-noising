@@ -12,6 +12,7 @@ class LogConfig:
     log_freq: int = 1000
     save_freq: int = 10000
     eval_episodes: int = 10
+    eval_nsteps: int = 0  # 0 = use default list from loss_type; otherwise single value
     save_video: bool = False
 
 
@@ -160,6 +161,10 @@ class TaskConfig:
     intent_indices: list[int] = field(
         default_factory=lambda: [0, 1]
     )  # obs indices to use for intent (used by PushT and other non-robomimic tasks)
+    decoder_uses_sampled_intent: bool = False  # If True, train action decoder on ODE-sampled intent
+    # instead of GT intent — closes the train/eval distribution gap. False = legacy behaviour.
+    decoder_curriculum_steps: int = 0  # If > 0 and decoder_uses_sampled_intent=True, use GT intent
+    # for the first N steps, then switch to ODE-sampled intent.
 
 
 @dataclass

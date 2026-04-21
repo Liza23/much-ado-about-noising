@@ -27,8 +27,9 @@ python examples/train_libero.py \
     optimization.batch_size=64 \
     optimization.loss_type=flow \
     optimization.weight_decay=1e-4 \
-    log.eval_episodes=50 \
-    log.eval_freq=20000 \
+    log.eval_episodes=10 \
+    log.eval_freq=100000 \
+    log.eval_nsteps=9 \
     log.save_freq=20000 \
     log.project=libero-experiments \
     log.group=libero-10-suite-image \

@@ -430,7 +430,18 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
 
         if ((n_gradient_step + 1) % config.log.save_freq) == 0:
             loguru.logger.info("Save model...")
-            logger.save_agent(agent=agent, identifier="latest")
+            latest_training_state = {
+                "n_gradient_step": n_gradient_step,
+                "best_metrics": best_metrics,
+                "eval_history": eval_history,
+                "intent_predictor_state": (
+                    intent_predictor.state_dict() if intent_predictor is not None else None
+                ),
+                "intent_encoder_state": (
+                    intent_encoder.state_dict() if intent_encoder is not None else None
+                ),
+            }
+            logger.save_agent(agent=agent, identifier="latest", training_state=latest_training_state)
 
         if ((n_gradient_step + 1) % config.log.eval_freq) == 0:
             loguru.logger.info("Evaluate model...")
@@ -438,7 +449,10 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
             if intent_predictor is not None:
                 intent_predictor.eval()
             metrics = {"step": n_gradient_step}
-            num_steps_list = get_default_step_list(config.optimization.loss_type)
+            if getattr(config.log, 'eval_nsteps', 0):
+                num_steps_list = [config.log.eval_nsteps]
+            else:
+                num_steps_list = get_default_step_list(config.optimization.loss_type)
             for num_steps in num_steps_list:
                 metrics.update(eval(config, envs, dataset, agent, logger, num_steps,
                                     intent_predictor=intent_predictor))
@@ -1213,13 +1227,19 @@ def main(config):
                 checkpoint_base_name += "_joint"
         if getattr(config.task, 'intent_type', 'mean') == 'encoded_mean':
             checkpoint_base_name += "_emb"  # encoded_mean has different model shapes
-        checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
-        if checkpoint_path:
-            loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")
-            loguru.logger.info("Loading checkpoint with optimizer state...")
-            resume_state = agent.load(str(checkpoint_path), load_optimizer=True)
+        # Prefer model_latest.pt in the run's log dir (has full training state)
+        model_latest_path = logger.model_dir / "model_latest.pt"
+        if model_latest_path.exists():
+            loguru.logger.info(f"Found model_latest.pt, resuming from {model_latest_path}")
+            resume_state = agent.load(str(model_latest_path), load_optimizer=True)
         else:
-            loguru.logger.info("No checkpoint found, starting training from scratch")
+            checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
+            if checkpoint_path:
+                loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")
+                loguru.logger.info("Loading checkpoint with optimizer state...")
+                resume_state = agent.load(str(checkpoint_path), load_optimizer=True)
+            else:
+                loguru.logger.info("No checkpoint found, starting training from scratch")
     elif config.mode == "train" and not config.optimization.auto_resume:
         loguru.logger.info("Auto-resume disabled, starting training from scratch")
 

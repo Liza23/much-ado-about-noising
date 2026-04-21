@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=libero-spatial-img-base
-#SBATCH --output=logs/libero_spatial_suite_image_baseline_%j.out
-#SBATCH --error=logs/libero_spatial_suite_image_baseline_%j.err
+#SBATCH --job-name=libero-10-img-fi-s
+#SBATCH --output=logs/libero_10_suite_image_flow_intent_sampled_%j.out
+#SBATCH --error=logs/libero_10_suite_image_flow_intent_sampled_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
@@ -21,7 +21,8 @@ export MUJOCO_GL=egl
 trap 'rm -rf "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR" "$XDG_RUNTIME_DIR"' EXIT
 
 python examples/train_libero.py \
-    task=libero_spatial_suite_image \
+    task=libero_10_suite_image_flow_intent \
+    network=mlp_flow_intent \
     optimization.gradient_steps=1000000 \
     optimization.batch_size=64 \
     optimization.loss_type=flow \
@@ -31,9 +32,10 @@ python examples/train_libero.py \
     log.eval_nsteps=9 \
     log.save_freq=20000 \
     log.project=libero-experiments \
-    log.group=libero-spatial-suite-image \
-    log.exp_name=baseline \
-    log.log_dir="/data/user_data/ldahiya/libero-train/libero-spatial-suite-image/baseline" \
+    log.group=libero-10-suite-image \
+    log.exp_name=flow_intent_sampled \
+    log.log_dir="/data/user_data/ldahiya/libero-train/libero-10-suite-image/flow_intent_sampled" \
     task.num_envs=5 \
+    task.decoder_uses_sampled_intent=true \
     optimization.auto_resume=true \
     log.save_video=false

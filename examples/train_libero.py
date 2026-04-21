@@ -249,7 +249,15 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
 
         if (n_gradient_step + 1) % config.log.save_freq == 0:
             loguru.logger.info("Saving latest checkpoint...")
-            logger.save_agent(agent=agent, identifier="latest")
+            logger.save_agent(
+                agent=agent,
+                identifier="latest",
+                training_state={
+                    "n_gradient_step": n_gradient_step,
+                    "best_metrics": best_metrics,
+                    "eval_history": eval_history,
+                },
+            )
 
         if (n_gradient_step + 1) % config.log.eval_freq == 0:
             loguru.logger.info("Evaluating...")
@@ -257,7 +265,8 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
             if intent_predictor is not None:
                 intent_predictor.eval()
             metrics = {"step": n_gradient_step}
-            num_steps_list = get_default_step_list(config.optimization.loss_type)
+            _eval_nsteps = getattr(config.log, "eval_nsteps", 0)
+            num_steps_list = [_eval_nsteps] if _eval_nsteps else get_default_step_list(config.optimization.loss_type)
             for num_steps in num_steps_list:
                 metrics.update(evaluate(
                     config, envs, dataset, agent, logger, num_steps,
@@ -645,10 +654,15 @@ def main(config):
             ckpt_name += "_learned"
         if getattr(config.task, "intent_type", "mean") == "encoded_mean":
             ckpt_name += "_emb"
-        ckpt_path = logger.find_latest_checkpoint(ckpt_name)
-        if ckpt_path:
-            loguru.logger.info(f"Auto-resuming from {ckpt_path}")
-            resume_state = agent.load(str(ckpt_path), load_optimizer=True)
+        model_latest_path = logger.model_dir / "model_latest.pt"
+        if model_latest_path.exists():
+            loguru.logger.info(f"Auto-resuming from model_latest.pt at {model_latest_path}")
+            resume_state = agent.load(str(model_latest_path), load_optimizer=True)
+        else:
+            ckpt_path = logger.find_latest_checkpoint(ckpt_name)
+            if ckpt_path:
+                loguru.logger.info(f"Auto-resuming from {ckpt_path}")
+                resume_state = agent.load(str(ckpt_path), load_optimizer=True)
 
     # Restore intent predictor/encoder from checkpoint
     if intent_predictor is not None and resume_state is not None:
@@ -667,7 +681,8 @@ def main(config):
         agent.eval()
         if intent_predictor is not None:
             intent_predictor.eval()
-        num_steps_list = get_default_step_list(config.optimization.loss_type)
+        _eval_nsteps = getattr(config.log, "eval_nsteps", 0)
+        num_steps_list = [_eval_nsteps] if _eval_nsteps else get_default_step_list(config.optimization.loss_type)
         for num_steps in num_steps_list:
             metrics = evaluate(
                 config, envs, dataset, agent, logger, num_steps,
