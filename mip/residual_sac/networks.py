@@ -19,11 +19,14 @@ def _build_mlp(
     hidden_dims: tuple[int, ...],
     activation: type[nn.Module] = nn.ReLU,
     output_activation: type[nn.Module] | None = None,
+    use_layer_norm: bool = False,
 ) -> nn.Sequential:
     layers: list[nn.Module] = []
     prev = input_dim
     for h in hidden_dims:
         layers.append(nn.Linear(prev, h))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(h))
         layers.append(activation())
         prev = h
     layers.append(nn.Linear(prev, output_dim))
@@ -55,6 +58,7 @@ class TanhGaussianPolicy(nn.Module):
         log_std_min: float = -5.0,
         log_std_max: float = 2.0,
         action_mag: float = 1.0,
+        use_layer_norm: bool = False,
     ):
         super().__init__()
         self.act_dim_flat = act_dim_flat
@@ -62,7 +66,7 @@ class TanhGaussianPolicy(nn.Module):
         self.log_std_max = log_std_max
         self.action_mag = action_mag
 
-        self.trunk = _build_mlp(obs_dim, hidden_dims[-1], hidden_dims[:-1])
+        self.trunk = _build_mlp(obs_dim, hidden_dims[-1], hidden_dims[:-1], use_layer_norm=use_layer_norm)
         self.mean_head = nn.Linear(hidden_dims[-1], act_dim_flat)
         self.log_std_head = nn.Linear(hidden_dims[-1], act_dim_flat)
 
@@ -111,9 +115,10 @@ class QNetwork(nn.Module):
         obs_dim: int,
         act_dim_flat: int,
         hidden_dims: tuple[int, ...] = (256, 256, 256),
+        use_layer_norm: bool = False,
     ):
         super().__init__()
-        self.net = _build_mlp(obs_dim + act_dim_flat, 1, hidden_dims)
+        self.net = _build_mlp(obs_dim + act_dim_flat, 1, hidden_dims, use_layer_norm=use_layer_norm)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Returns Q-value of shape (B, 1)."""
@@ -136,10 +141,11 @@ class QEnsemble(nn.Module):
         act_dim_flat: int,
         hidden_dims: tuple[int, ...] = (256, 256, 256),
         num_qs: int = 2,
+        use_layer_norm: bool = False,
     ):
         super().__init__()
         self.q_nets = nn.ModuleList(
-            [QNetwork(obs_dim, act_dim_flat, hidden_dims) for _ in range(num_qs)]
+            [QNetwork(obs_dim, act_dim_flat, hidden_dims, use_layer_norm=use_layer_norm) for _ in range(num_qs)]
         )
         self.num_qs = num_qs
 

@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import math
 import pickle
 import sys
 from pathlib import Path
@@ -127,6 +128,10 @@ def main():
                         help="Number of spectral clusters per panel")
     parser.add_argument("--tag", default=None,
                         help="Optional tag prepended to figure title")
+    parser.add_argument("--labels", nargs="+", default=None,
+                        help="Subset of run labels to plot (default: all)")
+    parser.add_argument("--n-cols", type=int, default=None,
+                        help="Number of columns per row (default: all in one row)")
     args = parser.parse_args()
 
     with open(args.pkl_path, "rb") as f:
@@ -134,6 +139,8 @@ def main():
 
     runs = data["runs"]           # label → {"per_state": [[rollouts], ...]}
     labels = list(runs.keys())
+    if args.labels is not None:
+        labels = [l for l in args.labels if l in runs]
     mode = data.get("mode", "model_comparison")
     is_perturb = mode == "perturb"
 
@@ -195,8 +202,10 @@ def main():
                     proj_trajs.append(proj)
                 labels_per_env[lbl] = spectral_cluster_trajs(proj_trajs, args.k)
 
-            n_cols = len(labels)
-            fig = plt.figure(figsize=(5 * n_cols, 5))
+            n_panels = len(labels)
+            n_cols = args.n_cols or n_panels
+            n_rows = math.ceil(n_panels / n_cols)
+            fig = plt.figure(figsize=(5 * n_cols, 5 * n_rows))
 
             tag = f"[{args.tag}] " if args.tag else ""
             fig.suptitle(
@@ -209,7 +218,7 @@ def main():
                 trajs = trajs_per_env[lbl]
                 cluster_lbs = labels_per_env[lbl]
                 sm = state_metas[lbl]
-                ax = fig.add_subplot(1, n_cols, col + 1, projection="3d")
+                ax = fig.add_subplot(n_rows, n_cols, col + 1, projection="3d")
                 panel_label = f"{lbl}\nt={sm['timestep']} var={sm['variance']:.4f}"
                 if trajs:
                     plot_model_panel(ax, trajs, cluster_lbs, pca, panel_label)
@@ -278,7 +287,9 @@ def main():
                 labels_per_model[lbl] = spectral_cluster_trajs(proj_trajs, args.k)
 
             n_models = len(labels)
-            fig = plt.figure(figsize=(5 * n_models, 5))
+            n_cols = args.n_cols or n_models
+            n_rows = math.ceil(n_models / n_cols)
+            fig = plt.figure(figsize=(5 * n_cols, 5 * n_rows))
 
             tag = f"[{args.tag}] " if args.tag else ""
             fig.suptitle(
@@ -290,7 +301,7 @@ def main():
             for col, lbl in enumerate(labels):
                 trajs = trajs_per_model[lbl]
                 cluster_labels = labels_per_model[lbl]
-                ax = fig.add_subplot(1, n_models, col + 1, projection="3d")
+                ax = fig.add_subplot(n_rows, n_cols, col + 1, projection="3d")
                 if trajs:
                     plot_model_panel(ax, trajs, cluster_labels, pca, lbl)
                 else:

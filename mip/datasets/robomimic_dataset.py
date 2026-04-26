@@ -57,6 +57,8 @@ def make_dataset(task_config, mode="train"):
     intent_horizon = getattr(task_config, "intent_horizon", task_config.act_steps)
     intent_type = getattr(task_config, "intent_type", "mean")
     intent_keys = getattr(task_config, "intent_keys", ["robot0_eef_pos", "robot0_eef_quat"])
+    intent_sub_slice = getattr(task_config, "intent_sub_slice", None)
+    intent_key_groups = getattr(task_config, "intent_key_groups", None)
 
     if task_config.env_name == "pusht":
         from mip.datasets.pusht_dataset import make_dataset as make_pusht_dataset
@@ -89,6 +91,8 @@ def make_dataset(task_config, mode="train"):
                 intent_horizon=intent_horizon,
                 intent_type=intent_type,
                 intent_keys=intent_keys,
+                intent_sub_slice=intent_sub_slice,
+                intent_key_groups=intent_key_groups,
             )
         elif task_config.obs_type == "image":
             load_sim_states = getattr(task_config, "load_sim_states", False)
@@ -140,6 +144,8 @@ class RobomimicDataset(BaseDataset):
         intent_horizon: int | None = None,  # lookahead for intent extraction; defaults to act_steps
         intent_type: str = "mean",  # "mean": mean(eef[t+1..t+N]); "final": eef[t+N]
         intent_keys: list[str] | None = None,  # obs keys to use for intent; defaults to eef pos+quat
+        intent_sub_slice: list[int] | None = None,  # [start, end] relative to intent_keys range
+        intent_key_groups: list[dict] | None = None,  # multi-group intent; overrides intent_keys+sub_slice
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -256,30 +262,60 @@ class RobomimicDataset(BaseDataset):
         self.normalizer = self.get_normalizer()
 
         # Compute intent slice indices in the concatenated obs vector.
-        # Uses configurable intent_keys (defaults to eef pos+quat for robomimic tasks).
+        # Supports single-group (intent_keys + optional sub_slice) and multi-group (intent_key_groups).
         if intent_keys is None:
             intent_keys = ["robot0_eef_pos", "robot0_eef_quat"]
         self.intent_keys = intent_keys
         self.intent_start = None
         self.intent_end = None
-        offset = 0
+
+        # Build key_offsets and key_dims from the HDF5 file.
+        key_offsets = {}
+        key_dims = {}
         with h5py.File(dataset_dir) as f:
             demo0_obs = f["data/demo_0/obs"]
+            offset = 0
             for k in obs_keys:
                 key_dim = demo0_obs[k].shape[-1]
-                if k == intent_keys[0]:
-                    self.intent_start = offset
-                if k == intent_keys[-1]:
-                    self.intent_end = offset + key_dim
+                key_offsets[k] = offset
+                key_dims[k] = key_dim
                 offset += key_dim
+
+        if intent_key_groups is not None:
+            # Multi-group: resolve each group to an (abs_start, abs_end) slice and concatenate.
+            self.intent_slices = []
+            for group in intent_key_groups:
+                g_keys = group["keys"]
+                g_start = key_offsets[g_keys[0]]
+                g_end = key_offsets[g_keys[-1]] + key_dims[g_keys[-1]]
+                sub = group.get("sub_slice", None)
+                if sub is not None:
+                    g_end = g_start + sub[1]
+                    g_start = g_start + sub[0]
+                self.intent_slices.append((g_start, g_end))
+            # Keep intent_start/intent_end pointing to first group for CV proxy compat.
+            self.intent_start, self.intent_end = self.intent_slices[0]
+        else:
+            # Single-group (existing behaviour).
+            for k in obs_keys:
+                if k == intent_keys[0]:
+                    self.intent_start = key_offsets[k]
+                if k == intent_keys[-1]:
+                    self.intent_end = key_offsets[k] + key_dims[k]
+            if intent_sub_slice is not None and self.intent_start is not None:
+                sub_start, sub_end = intent_sub_slice
+                self.intent_end = self.intent_start + sub_end
+                self.intent_start = self.intent_start + sub_start
+            self.intent_slices = [(self.intent_start, self.intent_end)]
+
         if intent_conditioning:
             if self.intent_start is None or self.intent_end is None:
                 raise ValueError(
                     f"intent_conditioning=True requires obs_keys to include intent_keys={intent_keys}"
                 )
+            total_dim = sum(e - s for s, e in self.intent_slices)
             logger.info(
-                f"Intent conditioning enabled: obs indices [{self.intent_start}:{self.intent_end}] "
-                f"(dim={self.intent_end - self.intent_start}, keys={intent_keys})"
+                f"Intent conditioning enabled: {self.intent_slices} (dim={total_dim})"
             )
 
     def undo_transform_action(self, action):
@@ -342,7 +378,8 @@ class RobomimicDataset(BaseDataset):
                 # GT future intent — used by Config A (FlowIntentAgent) to learn the distribution.
                 future_start = self.obs_steps
                 future_end = self.obs_steps + self.intent_horizon
-                future_eef = state[future_start:future_end, self.intent_start:self.intent_end]
+                future_parts = [state[future_start:future_end, s:e] for s, e in self.intent_slices]
+                future_eef = np.concatenate(future_parts, axis=-1)
                 if self.intent_type == "sequence":
                     intent = future_eef.reshape(-1).astype(np.float32)
                 elif self.intent_type == "final":

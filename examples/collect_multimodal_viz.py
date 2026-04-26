@@ -295,7 +295,7 @@ def collect_rollouts_simple(config, agent, dataset, envs, n_rollouts, device,
                             is_flow_intent=False, intent_predictor=None, num_steps=9):
     """Simplified rollout collection returning action chunks + success flags."""
     from collect_diversity_rollouts import collect_rollouts
-    chunks, successes, steer_acts, steer_ints = collect_rollouts(
+    chunks, successes, _, steer_acts, steer_ints = collect_rollouts(
         config, agent, dataset, envs,
         n_rollouts=n_rollouts,
         device=device,
@@ -347,12 +347,15 @@ def _run_append(args):
             continue
 
         print(f"\n{'=' * 60}\nAppending: {label}  |  ckpt: {ckpt_path}\n{'=' * 60}")
-        # Extract flow_intent_ckpt= from overrides (not a Hydra key)
+        # Extract non-Hydra keys: flow_intent_ckpt and agent_type
         fi_ckpt = None
+        agent_type = None
         hydra_overrides = []
         for ov in user_overrides:
             if ov.startswith("flow_intent_ckpt="):
                 fi_ckpt = ov.split("=", 1)[1]
+            elif ov.startswith("agent_type="):
+                agent_type = ov.split("=", 1)[1]
             else:
                 hydra_overrides.append(ov)
         overrides = hydra_overrides + [
@@ -367,7 +370,7 @@ def _run_append(args):
 
         try:
             agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device,
-                                                  flow_intent_ckpt=fi_ckpt)
+                                                  flow_intent_ckpt=fi_ckpt, agent_type=agent_type)
         except Exception as e:
             print(f"[ERROR] Failed to load {label}: {e}")
             envs.close()
@@ -531,12 +534,15 @@ def main():
         print(f"Label: {label}  |  ckpt: {ckpt_path}")
         print(f"{'=' * 60}")
 
-        # Extract flow_intent_ckpt= from overrides (not a Hydra key)
+        # Extract non-Hydra keys: flow_intent_ckpt and agent_type
         fi_ckpt = None
+        agent_type = None
         hydra_overrides = []
         for ov in user_overrides:
             if ov.startswith("flow_intent_ckpt="):
                 fi_ckpt = ov.split("=", 1)[1]
+            elif ov.startswith("agent_type="):
+                agent_type = ov.split("=", 1)[1]
             else:
                 hydra_overrides.append(ov)
         overrides = hydra_overrides + [
@@ -551,7 +557,7 @@ def main():
 
         try:
             agent, intent_predictor = load_model(ckpt_path, config, dataset, args.device,
-                                                  flow_intent_ckpt=fi_ckpt)
+                                                  flow_intent_ckpt=fi_ckpt, agent_type=agent_type)
         except Exception as e:
             print(f"[ERROR] Failed to load {label}: {e}")
             envs.close()

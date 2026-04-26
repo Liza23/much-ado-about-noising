@@ -158,6 +158,14 @@ class TaskConfig:
     intent_keys: list[str] = field(
         default_factory=lambda: ["robot0_eef_pos", "robot0_eef_quat"]
     )  # obs keys to use for intent extraction; defaults to eef pos+quat for robomimic tasks
+    intent_sub_slice: list[int] | None = None
+    # [start, end] indices relative to the start of the intent_keys range.
+    # e.g. [0, 3] selects the first 3 dims (object XYZ) from a wider key like "object".
+    # None = use the full intent_keys range.
+    intent_key_groups: list[dict] | None = None
+    # List of {keys: [...], sub_slice?: [start, end]} dicts. Each group resolves to a
+    # contiguous slice of the obs vector; groups are concatenated into one intent vector.
+    # When set, overrides intent_keys + intent_sub_slice.
     intent_indices: list[int] = field(
         default_factory=lambda: [0, 1]
     )  # obs indices to use for intent (used by PushT and other non-robomimic tasks)
@@ -168,9 +176,23 @@ class TaskConfig:
 
 
 @dataclass
+class PostBCConfig:
+    ensemble_size: int = 100
+    ensemble_hidden_dim: int = 256
+    ensemble_n_layers: int = 3
+    ensemble_epochs: int = 50
+    ensemble_batch_size: int = 256
+    ensemble_lr: float = 1e-3
+    alpha: float = 1.0
+    variance_path: str = ""  # auto-set to <log_dir>/ensemble_variance.npy if empty
+    skip_ensemble_training: bool = False  # if True, load variance_path directly
+
+
+@dataclass
 class Config:
     optimization: OptimizationConfig
     network: NetworkConfig
     task: TaskConfig
     log: LogConfig
+    postbc: PostBCConfig = field(default_factory=PostBCConfig)
     mode: str = "train"  # "train" or "eval"

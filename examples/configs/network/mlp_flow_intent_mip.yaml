@@ -1,0 +1,9 @@
+# @package network
+# Config A-MIP network config: MLP backbone for both intent flow and action flow.
+# Intent trained with mip_loss; action flow trained with flow_loss (GT intent conditioning).
+defaults:
+  - mlp          # inherits network_type=mlp, emb_dim=512, num_layers=8, dropout=0.1
+  - _self_
+
+# Selects Config A-MIP: FlowIntentAgent with MIP-style action flow.
+arch_variant: "flow_intent_mip"

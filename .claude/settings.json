@@ -14,7 +14,8 @@
       "Read(//home/ldahiya/LIBERO-PRO/libero/libero/benchmark/**)",
       "Read(//home/ldahiya/LIBERO-PRO/libero/libero/**)",
       "Bash(find /data/user_data/ldahiya/libero-train/libero-*-suite-image -name \"wandb-summary.json\" -type f)",
-      "Bash(squeue -u ldahiya --format=\"%.10i %.22j %.8T %.10M %R\")"
+      "Bash(squeue -u ldahiya --format=\"%.10i %.22j %.8T %.10M %R\")",
+      "WebSearch"
     ]
   },
   "model": "sonnet"

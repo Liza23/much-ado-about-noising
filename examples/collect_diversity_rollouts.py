@@ -1,4 +1,4 @@
-"""Stage 1: Roll out policy variants and save action chunks to a .pkl file.
+"""Stage 1: Roll out policy variants and save action chunks + visited states to a .pkl file.
 
 Rolls out N episodes per variant, collecting predicted action chunks at every
 timestep. Also gathers steerability data for flow_intent variants (K independent
@@ -24,11 +24,15 @@ Output .pkl structure:
         "<label>": {
           "action_chunks": np.ndarray (N_total, flat_dim),  # flattened per chunk
           "success":       list[bool],                       # per episode
+          "obs_states":    np.ndarray (N_steps_total, obs_dim),  # raw env states per step
           # flow_intent only:
           "steer_actions": np.ndarray (N_eps, K, flat_dim),
           "steer_intents": np.ndarray (N_eps, K, intent_dim),
         },
-        "gt_demos": {"action_chunks": np.ndarray (M, flat_dim)},
+        "gt_demos": {
+          "action_chunks": np.ndarray (M, flat_dim),
+          "obs_states":    np.ndarray (M, obs_dim),  # demo states from dataset
+        },
       }
     }
 """
@@ -66,6 +70,8 @@ from mip.datasets.libero_dataset import make_dataset as make_dataset_libero
 from mip.envs.libero import make_vec_env as make_vec_env_libero
 from mip.torch_utils import set_seed
 from mip.residual_parl.parl_agent import ResidualPARLAgent, PARLConfig
+from mip.dsrl.dsrl_agent import DSRLSACAgent, DSRLConfig
+from mip.residual_sac.sac_agent import ResidualSACAgent, SACConfig
 
 
 def _is_kitchen(task_config):
@@ -238,6 +244,37 @@ class ResidualPARLWrapper:
         self.flow_intent.eval()
         return self
 
+    def sample_intent(self, obs=None, use_ema: bool = True, num_steps: int = -1, **kwargs):
+        """Delegate intent sampling to the underlying FlowIntentAgent."""
+        return self.flow_intent.sample_intent(obs=obs, use_ema=use_ema, num_steps=num_steps, **kwargs)
+
+    def sample_given_intent(self, obs=None, intent_vec=None, use_ema: bool = True,
+                            num_steps: int = -1, **kwargs):
+        """Run flow-intent decoder with fixed intent, then apply PARL refinement."""
+        base_actions = self.flow_intent.sample_given_intent(
+            obs=obs, intent_vec=intent_vec, use_ema=use_ema, num_steps=num_steps, **kwargs
+        )
+        # Apply PARL residual on top of the committed-intent base actions
+        B = base_actions.shape[0]
+        s = self.config.task.obs_steps - 1
+        act_steps = self.config.task.act_steps
+        base_chunk = base_actions[:, s:s + act_steps, :]
+        base_flat_np = base_chunk.reshape(B, -1).cpu().numpy()
+        obs_flat_np = obs.reshape(B, -1).cpu().numpy()
+        composed_list = []
+        for i in range(B):
+            a_exec, _, _ = self.parl.sample_action(
+                obs_flat_np[i], base_flat_np[i], deterministic=True
+            )
+            composed_list.append(a_exec)
+        composed_flat = np.stack(composed_list)
+        composed_chunk = torch.tensor(
+            composed_flat, device=base_actions.device, dtype=base_actions.dtype
+        ).reshape(B, act_steps, -1)
+        composed_full = base_actions.clone()
+        composed_full[:, s:s + act_steps, :] = composed_chunk
+        return composed_full
+
     def sample(self, obs=None, use_ema: bool = True, num_steps: int = -1,
                return_intent: bool = False, **kwargs):
         """obs: (B, obs_steps, obs_dim) tensor — same as FlowIntentAgent.sample()."""
@@ -276,8 +313,132 @@ class ResidualPARLWrapper:
         return composed_full
 
 
+class DSRLWrapper:
+    """Wraps FlowIntentAgent + DSRLSACAgent. DSRL actor picks intent ODE noise x_0.
+
+    Each sample_intent call draws a stochastic x_0 from the DSRL actor, runs the
+    intent ODE from that noise, and returns the resulting intent_vec — giving each
+    ghost rollout a different DSRL-steered intent.
+    """
+
+    def __init__(self, flow_intent: FlowIntentAgent, dsrl: DSRLSACAgent, config):
+        self.flow_intent = flow_intent
+        self.dsrl = dsrl
+        self.config = config
+
+    def eval(self):
+        self.flow_intent.eval()
+        return self
+
+    def sample_intent(self, obs=None, use_ema: bool = True, num_steps: int = -1, **kwargs):
+        B = obs.shape[0]
+        obs_flat_np = obs.reshape(B, -1).cpu().numpy()
+        noises = []
+        for i in range(B):
+            x0_np, _ = self.dsrl.sample_noise(obs_flat_np[i], deterministic=False)
+            noises.append(x0_np)
+        intent_noise = torch.tensor(
+            np.stack(noises), device=obs.device, dtype=obs.dtype
+        ).unsqueeze(1)  # (B, 1, intent_dim)
+        return self.flow_intent.sample_intent_from_noise(obs, intent_noise, use_ema=use_ema, num_steps=num_steps)
+
+    def sample_given_intent(self, obs=None, intent_vec=None, use_ema: bool = True,
+                            num_steps: int = -1, **kwargs):
+        return self.flow_intent.sample_given_intent(
+            obs=obs, intent_vec=intent_vec, use_ema=use_ema, num_steps=num_steps
+        )
+
+    def sample(self, obs=None, use_ema: bool = True, num_steps: int = -1,
+               return_intent: bool = False, **kwargs):
+        intent_vec = self.sample_intent(obs=obs, use_ema=use_ema, num_steps=num_steps)
+        actions = self.sample_given_intent(obs=obs, intent_vec=intent_vec, use_ema=use_ema, num_steps=num_steps)
+        if return_intent:
+            return actions, intent_vec
+        return actions
+
+
+class PlainDSRLWrapper:
+    """Wraps TrainingAgent + DSRLSACAgent for plain (non-intent) flow DSRL.
+
+    DSRL actor picks action ODE noise x_0; each ghost gets a different noise sample.
+    """
+
+    def __init__(self, flow_agent: TrainingAgent, dsrl: DSRLSACAgent, config):
+        self.flow_agent = flow_agent
+        self.dsrl = dsrl
+        self.config = config
+
+    def eval(self):
+        self.flow_agent.eval()
+        return self
+
+    def sample(self, obs=None, use_ema: bool = True, num_steps: int = -1, **kwargs):
+        obs_tensor = obs["state"] if isinstance(obs, dict) else obs
+        B = obs_tensor.shape[0]
+        obs_flat_np = obs_tensor.reshape(B, -1).cpu().numpy()
+        noises = []
+        for i in range(B):
+            x0_np, _ = self.dsrl.sample_noise(obs_flat_np[i], deterministic=False)
+            noises.append(x0_np)
+        # x0 shape: (B, Ta * act_dim) → (B, Ta, act_dim)
+        Ta = self.config.task.horizon
+        act_dim = self.config.task.act_dim
+        act_0 = torch.tensor(
+            np.stack(noises), device=obs_tensor.device, dtype=obs_tensor.dtype
+        ).reshape(B, Ta, act_dim)
+        return self.flow_agent.sample(obs=obs, use_ema=use_ema, num_steps=num_steps, act_0=act_0)
+
+
+class ResidualSACWrapper:
+    """Wraps FlowIntentAgent + ResidualSACAgent. Intent from flow, action refined by SAC."""
+
+    def __init__(self, flow_intent: FlowIntentAgent, sac: ResidualSACAgent, config):
+        self.flow_intent = flow_intent
+        self.sac = sac
+        self.config = config
+
+    def eval(self):
+        self.flow_intent.eval()
+        return self
+
+    def sample_intent(self, obs=None, use_ema: bool = True, num_steps: int = -1, **kwargs):
+        return self.flow_intent.sample_intent(obs=obs, use_ema=use_ema, num_steps=num_steps)
+
+    def sample_given_intent(self, obs=None, intent_vec=None, use_ema: bool = True,
+                            num_steps: int = -1, **kwargs):
+        base_actions = self.flow_intent.sample_given_intent(
+            obs=obs, intent_vec=intent_vec, use_ema=use_ema, num_steps=num_steps
+        )
+        B = base_actions.shape[0]
+        s = self.config.task.obs_steps - 1
+        act_steps = self.config.task.act_steps
+        base_chunk = base_actions[:, s:s + act_steps, :]
+        base_flat_np = base_chunk.reshape(B, -1).cpu().numpy()
+        obs_flat_np = obs.reshape(B, -1).cpu().numpy()
+        composed_list = []
+        for i in range(B):
+            a_exec, _, _ = self.sac.sample_action(obs_flat_np[i], base_flat_np[i], deterministic=True)
+            composed_list.append(a_exec)
+        composed_flat = np.stack(composed_list)
+        composed_chunk = torch.tensor(
+            composed_flat, device=base_actions.device, dtype=base_actions.dtype
+        ).reshape(B, act_steps, -1)
+        composed_full = base_actions.clone()
+        composed_full[:, s:s + act_steps, :] = composed_chunk
+        return composed_full
+
+    def sample(self, obs=None, use_ema: bool = True, num_steps: int = -1,
+               return_intent: bool = False, **kwargs):
+        intent_vec = self.sample_intent(obs=obs, use_ema=use_ema, num_steps=num_steps)
+        actions = self.sample_given_intent(obs=obs, intent_vec=intent_vec, use_ema=use_ema, num_steps=num_steps)
+        if return_intent:
+            return actions, intent_vec
+        return actions
+
+
 def load_model(checkpoint_path: str, config, dataset, device: str,
-               flow_intent_ckpt: str | None = None):
+               flow_intent_ckpt: str | None = None,
+               agent_type: str | None = None):
     """Load agent and (if needed) intent predictor from checkpoint.
 
     Returns:
@@ -293,33 +454,66 @@ def load_model(checkpoint_path: str, config, dataset, device: str,
     For image obs the CV proxy is not valid for encoded_mean, so we raise if
     the predictor is required but the sidecar is missing.
     """
-    # Detect PARL checkpoint by its state-dict keys before patching config.
+    # Detect RL-style checkpoints (PARL/DSRL/SAC) by state-dict keys.
     _probe = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if isinstance(_probe, dict) and "actor" in _probe and "critic" in _probe:
         if flow_intent_ckpt is None:
             raise ValueError(
-                "PARL checkpoint detected but flow_intent_ckpt not provided. "
-                "Pass flow_intent_ckpt=... in the run spec."
+                "RL checkpoint detected but flow_intent_ckpt not provided. "
+                "Pass flow_intent_ckpt=... in the run spec. "
+                "(For plain_dsrl, pass the baseline flow checkpoint as flow_intent_ckpt.)"
             )
-        # Patch config from the flow_intent checkpoint (sets obs_dim etc.)
-        _patch_config_from_checkpoint(flow_intent_ckpt, config)
-        # Load frozen flow-intent backbone
-        fi_agent = FlowIntentAgent(config)
-        fi_agent.load(flow_intent_ckpt, load_optimizer=False)
-        fi_agent.eval()
 
-        # Build PARL agent with default hyperparams
+        _has_log_alpha = "log_alpha" in _probe  # DSRL/SAC have it; PARL does not
+
         obs_dim_per_step = dataset[0]["obs"]["state"].shape[-1]
         obs_dim_flat = config.task.obs_steps * obs_dim_per_step
         act_dim = config.task.act_dim
         act_steps = config.task.act_steps
+
+        if agent_type in ("dsrl", "plain_dsrl"):
+            is_intent = agent_type == "dsrl"
+            if is_intent:
+                _patch_config_from_checkpoint(flow_intent_ckpt, config)
+                fi_agent = FlowIntentAgent(config)
+                fi_agent.load(flow_intent_ckpt, load_optimizer=False)
+                fi_agent.eval()
+                noise_dim = config.task.intent_dim
+            else:
+                _patch_config_from_checkpoint(flow_intent_ckpt, config)
+                flow_agent = TrainingAgent(config)
+                flow_agent.load(flow_intent_ckpt, load_optimizer=False)
+                flow_agent.eval()
+                noise_dim = config.task.horizon * act_dim
+            dsrl_cfg = DSRLConfig(device=device)
+            dsrl_agent = DSRLSACAgent(config=dsrl_cfg, obs_dim=obs_dim_flat, Ta=1, act_dim=noise_dim)
+            dsrl_agent.load(checkpoint_path)
+            if is_intent:
+                return DSRLWrapper(fi_agent, dsrl_agent, config), None
+            else:
+                return PlainDSRLWrapper(flow_agent, dsrl_agent, config), None
+
+        if agent_type == "residual_sac":
+            _patch_config_from_checkpoint(flow_intent_ckpt, config)
+            fi_agent = FlowIntentAgent(config)
+            fi_agent.load(flow_intent_ckpt, load_optimizer=False)
+            fi_agent.eval()
+            sac_cfg = SACConfig(device=device)
+            sac_agent = ResidualSACAgent(sac_cfg, obs_dim=obs_dim_flat, act_dim=act_dim, query_freq=act_steps)
+            sac_agent.load(checkpoint_path)
+            return ResidualSACWrapper(fi_agent, sac_agent, config), None
+
+        # Default: PARL (no log_alpha)
+        _patch_config_from_checkpoint(flow_intent_ckpt, config)
+        fi_agent = FlowIntentAgent(config)
+        fi_agent.load(flow_intent_ckpt, load_optimizer=False)
+        fi_agent.eval()
         parl_config = PARLConfig(device=device)
         parl_agent = ResidualPARLAgent(
             parl_config, obs_dim=obs_dim_flat, act_dim=act_dim, query_freq=act_steps
         )
         parl_agent.set_flow_intent(fi_agent)
         parl_agent.load(checkpoint_path)
-
         wrapper = ResidualPARLWrapper(fi_agent, parl_agent, config)
         return wrapper, None
 
@@ -527,7 +721,7 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
 
 def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
                      is_flow_intent: bool = False, intent_predictor=None, num_steps: int = 9):
-    """Run n_rollouts and return action chunks + success flags.
+    """Run n_rollouts and return action chunks + visited states + success flags.
 
     Works for both state and image observations.
     For flow_intent: also collects steerability data at the first timestep.
@@ -535,11 +729,13 @@ def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
     Returns:
         action_chunks: list of 1D np arrays (flattened chunk per timestep)
         ep_success:    list of bool, one per episode
+        obs_states:    np.ndarray (N_steps_total, obs_dim) — raw env obs, last step only
         steer_actions: np.ndarray (n_eps, STEER_K, flat_dim) or None
         steer_intents: np.ndarray (n_eps, STEER_K, intent_dim) or None
     """
     action_chunks = []
     ep_success = []
+    obs_states = []  # raw (unnormalized) obs at each step: (obs_dim,) for state obs
     steer_actions_list = []
     steer_intents_list = []
     s = config.task.obs_steps - 1  # action slice start
@@ -553,6 +749,12 @@ def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
         first_step = True
 
         while t < config.task.max_episode_steps:
+            # Record raw env state (most recent obs step, before normalization)
+            if config.task.obs_type == "state":
+                obs_states.append(obs[0, -1, :].copy())  # (obs_dim,), env 0 only
+            elif isinstance(obs, dict) and "state" in obs:
+                obs_states.append(obs["state"][0, -1, :].copy())
+
             obs_in, lowdim_t = preprocess_obs(
                 obs, config, dataset, device, intent_predictor=intent_predictor
             )
@@ -635,7 +837,8 @@ def collect_rollouts(config, agent, dataset, envs, n_rollouts: int, device: str,
 
     steer_actions = np.stack(steer_actions_list) if steer_actions_list else None
     steer_intents = np.stack(steer_intents_list) if steer_intents_list else None
-    return action_chunks, ep_success, steer_actions, steer_intents
+    obs_states_arr = np.array(obs_states, dtype=np.float32) if obs_states else None
+    return action_chunks, ep_success, obs_states_arr, steer_actions, steer_intents
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -666,6 +869,36 @@ def collect_gt_demos(dataset, act_steps: int, obs_steps: int, max_samples: int =
         if len(chunks) >= max_samples:
             break
     return np.array(chunks[:max_samples])
+
+
+def collect_gt_states(dataset, obs_steps: int, max_samples: int = 5000):
+    """Pull raw (unnormalized) obs states from the demo dataset.
+
+    Uses the most-recent obs step (index obs_steps-1) as the environment state
+    at each timestep, matching what collect_rollouts() records from the env.
+
+    Returns:
+        states: np.ndarray (N, obs_dim) — unnormalized demo states
+    """
+    from torch.utils.data import DataLoader
+    loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=0, drop_last=False)
+    s = obs_steps - 1
+    states = []
+    for batch in loader:
+        obs = batch.get("obs", {})
+        if isinstance(obs, dict):
+            state_norm = obs.get("state", None)
+        else:
+            state_norm = obs
+        if state_norm is None:
+            break
+        state_norm = state_norm.numpy()          # (B, obs_steps, obs_dim)
+        state_raw = dataset.normalizer["obs"]["state"].unnormalize(state_norm[:, s, :])
+        for i in range(state_raw.shape[0]):
+            states.append(state_raw[i])
+        if len(states) >= max_samples:
+            break
+    return np.array(states[:max_samples], dtype=np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -750,7 +983,7 @@ Example:
         _num_steps = int(get_default_step_list(config.optimization.loss_type)[0])
 
         try:
-            chunks, successes, steer_acts, steer_ints = collect_rollouts(
+            chunks, successes, obs_states_arr, steer_acts, steer_ints = collect_rollouts(
                 config, agent, dataset, envs,
                 n_rollouts=args.n_rollouts,
                 device=args.device,
@@ -771,6 +1004,9 @@ Example:
             "action_chunks": np.array(chunks),
             "success": successes,
         }
+        if obs_states_arr is not None:
+            entry["obs_states"] = obs_states_arr
+            print(f"  States: {obs_states_arr.shape}")
         if steer_acts is not None:
             entry["steer_actions"] = steer_acts
             entry["steer_intents"] = steer_ints
@@ -782,9 +1018,14 @@ Example:
         if not gt_demos_collected:
             print("Collecting GT demo actions from dataset...")
             gt_chunks = collect_gt_demos(dataset, act_steps=config.task.act_steps, obs_steps=config.task.obs_steps)
-            results[args.task]["gt_demos"] = {"action_chunks": gt_chunks}
+            print("Collecting GT demo states from dataset...")
+            gt_states = collect_gt_states(dataset, obs_steps=config.task.obs_steps)
+            results[args.task]["gt_demos"] = {
+                "action_chunks": gt_chunks,
+                "obs_states": gt_states,
+            }
             gt_demos_collected = True
-            print(f"  GT demos: {gt_chunks.shape}")
+            print(f"  GT demos: {gt_chunks.shape}  |  GT states: {gt_states.shape}")
 
     # Save
     with open(args.out, "wb") as f:

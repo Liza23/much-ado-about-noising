@@ -14,3 +14,4 @@ intent_training_mode: independent
 intent_keys:
   - ee_states
 decoder_uses_sampled_intent: false
+decoder_curriculum_steps: 0

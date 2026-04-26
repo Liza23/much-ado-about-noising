@@ -1,0 +1,30 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: mlp
+  - task: lift_mh_state_postbc
+  - _self_
+
+mode: "train"
+
+log:
+  project: "postbc"
+  group: "default"
+  exp_name: "${task.env_name}_${task.env_type}_postbc_seed${optimization.seed}"
+  eval_freq: 10000
+  log_freq: 1000
+  save_freq: 50000
+  eval_episodes: 20
+  save_video: false
+
+# PostBC configuration
+postbc:
+  ensemble_size: 100
+  ensemble_hidden_dim: 256
+  ensemble_n_layers: 3
+  ensemble_epochs: 50
+  ensemble_batch_size: 256
+  ensemble_lr: 1e-3
+  alpha: 1.0
+  variance_path: ""      # auto-set to <log_dir>/ensemble_variance.npy
+  skip_ensemble_training: false

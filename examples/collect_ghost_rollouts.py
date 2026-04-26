@@ -97,6 +97,10 @@ from collect_diversity_rollouts import (
     parse_run_spec,
     setup_config_for_env,
     load_model,
+    ResidualPARLWrapper,
+    DSRLWrapper,
+    PlainDSRLWrapper,
+    ResidualSACWrapper,
 )
 from mip.agent import TrainingAgent
 from mip.flow_intent_agent import FlowIntentAgent
@@ -133,7 +137,7 @@ def run_free_rollout(
     for step_i in range(0, n_future_steps, act_steps):
         fi_obs, _ = to_fi_obs(obs_buf, config, dataset, device)
         with torch.no_grad():
-            if fixed_intent is not None and isinstance(agent, FlowIntentAgent):
+            if fixed_intent is not None and isinstance(agent, (FlowIntentAgent, ResidualPARLWrapper, DSRLWrapper, ResidualSACWrapper)):
                 act_norm = agent.sample_given_intent(
                     obs=fi_obs, intent_vec=fixed_intent, use_ema=True, num_steps=num_steps
                 )
@@ -175,7 +179,7 @@ def find_critical_states(config, agent, dataset, envs, args, device):
     """
     num_steps = 9
     n_probe = args.n_probe
-    is_fi = isinstance(agent, FlowIntentAgent)
+    is_fi = isinstance(agent, (FlowIntentAgent, ResidualPARLWrapper, DSRLWrapper, ResidualSACWrapper))
     print(
         f"Probing {args.n_rollouts} rollouts (n_probe={n_probe} per state, "
         f"variance={'intent' if is_fi else 'action'}) ..."
@@ -274,7 +278,19 @@ def collect_ghost_for_model(
     the sim state before each rollout so the model runs from the same initial
     configuration.
     """
-    overrides = user_overrides + [
+    # Extract non-Hydra keys: flow_intent_ckpt and agent_type
+    flow_intent_ckpt = None
+    agent_type = None
+    hydra_overrides = []
+    for ov in user_overrides:
+        if ov.startswith("flow_intent_ckpt="):
+            flow_intent_ckpt = ov.split("=", 1)[1]
+        elif ov.startswith("agent_type="):
+            agent_type = ov.split("=", 1)[1]
+        else:
+            hydra_overrides.append(ov)
+
+    overrides = hydra_overrides + [
         f"optimization.device={device}",
         "task.num_envs=1",
         f"optimization.seed={args.seed}",
@@ -284,13 +300,14 @@ def collect_ghost_for_model(
     dataset = make_dataset(config)
     maybe_register_libero_pro_objects(config)
 
-    agent, _ = load_model(ckpt_path, config, dataset, device)
+    agent, _ = load_model(ckpt_path, config, dataset, device,
+                          flow_intent_ckpt=flow_intent_ckpt, agent_type=agent_type)
     agent.eval()
     if isinstance(agent, TrainingAgent):
         agent = BaselineAgentAdapter(agent, config)
 
     num_steps = 9
-    is_fi = isinstance(agent, FlowIntentAgent)
+    is_fi = isinstance(agent, (FlowIntentAgent, ResidualPARLWrapper, DSRLWrapper, ResidualSACWrapper))
     per_state = []
 
     for ci, state in enumerate(critical_states):
@@ -383,7 +400,7 @@ def collect_perturb_variant(
         state.pop("obs_raw", None)
 
     # Ghost rollouts per critical state
-    is_fi = isinstance(agent, FlowIntentAgent)
+    is_fi = isinstance(agent, (FlowIntentAgent, ResidualPARLWrapper, DSRLWrapper, ResidualSACWrapper))
     num_steps = 9
     per_state = []
     for ci, state in enumerate(critical_states):

@@ -1,0 +1,6 @@
+# @package task
+defaults:
+  - lift_mh_state
+  - _self_
+
+# No task-level overrides needed; PostBC params live in postbc.yaml.

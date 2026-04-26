@@ -158,6 +158,10 @@ def main(raw_cfg: DictConfig) -> None:
     loguru.logger.info(f"Dataset loaded ({len(dataset)} samples)")
     loguru.logger.info(f"Envs created: {config.task.env_name} x {config.task.num_envs}")
 
+    # ---- Set obs_dim from actual data (YAML value may differ from runtime shape) --
+    base_obs_dim = dataset[0]["obs"]["state"].shape[-1]
+    config.task.obs_dim = base_obs_dim
+
     # ---- Frozen flow-intent --------------------------------------------------
     flow_intent_ckpt = parl_cfg_dict["flow_intent_ckpt"]
     assert flow_intent_ckpt, "residual_parl.flow_intent_ckpt must be set"
@@ -176,8 +180,7 @@ def main(raw_cfg: DictConfig) -> None:
     loguru.logger.info(f"Frozen flow-intent loaded from {flow_intent_ckpt}")
 
     # ---- PARL agent ----------------------------------------------------------
-    obs_dim_per_step = dataset[0]["obs"]["state"].shape[-1]
-    obs_dim_flat = config.task.obs_steps * obs_dim_per_step
+    obs_dim_flat = config.task.obs_steps * base_obs_dim
     act_dim = config.task.act_dim
     act_steps = config.task.act_steps
 
@@ -356,21 +359,26 @@ def main(raw_cfg: DictConfig) -> None:
 
         # --- Evaluation ---
         if global_step % eval_freq < act_steps * config.task.num_envs:
-            eval_metrics = evaluate(
-                agent, envs, dataset, config, flow_intent,
-                num_episodes=eval_episodes,
-            )
-            eval_metrics["step"] = global_step
-            logger.log(eval_metrics, category="eval")
-            loguru.logger.info(
-                f"Step {global_step}: success={eval_metrics['eval/mean_success']:.2f}, "
-                f"reward={eval_metrics['eval/mean_reward']:.2f}"
-            )
+            try:
+                eval_metrics = evaluate(
+                    agent, envs, dataset, config, flow_intent,
+                    num_episodes=eval_episodes,
+                )
+                eval_metrics["step"] = global_step
+                logger.log(eval_metrics, category="eval")
+                loguru.logger.info(
+                    f"Step {global_step}: success={eval_metrics['eval/mean_success']:.2f}, "
+                    f"reward={eval_metrics['eval/mean_reward']:.2f}"
+                )
 
-            if eval_metrics["eval/mean_success"] > best_success:
-                best_success = eval_metrics["eval/mean_success"]
-                agent.save(str(save_dir / "best.pt"))
-                loguru.logger.info(f"New best success: {best_success:.2f}")
+                if eval_metrics["eval/mean_success"] > best_success:
+                    best_success = eval_metrics["eval/mean_success"]
+                    agent.save(str(save_dir / "best.pt"))
+                    loguru.logger.info(f"New best success: {best_success:.2f}")
+            except Exception as e:
+                loguru.logger.warning(f"Eval failed at step {global_step}, skipping: {e}")
+                envs.close()
+                envs = make_vec_env(config.task, seed=config.optimization.seed)
 
             # Re-reset env after eval
             obs_raw, _ = envs.reset()

@@ -1,0 +1,13 @@
+# @package task
+defaults:
+  - lift_ph_state
+  - _self_
+
+# Intent conditioning: mean future object XYZ position (3D) over the next act_steps steps.
+# Object position is the first 3 dims of the "object" obs key (full object state is ~10-14D).
+intent_conditioning: true
+intent_dim: 3
+intent_keys: ["object"]
+intent_sub_slice: [0, 3]
+intent_predictor: true
+intent_type: mean

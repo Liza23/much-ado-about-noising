@@ -1,0 +1,46 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: mlp
+  - task: lift_ph_state
+  - _self_
+
+mode: "train"
+
+log:
+  project: "dsrl"
+  group: "default"
+  exp_name: "${task.env_name}_${task.env_type}_dsrl_seed${optimization.seed}"
+  eval_freq: 10000
+  log_freq: 1000
+  save_freq: 50000
+  eval_episodes: 20
+  save_video: false
+
+# DSRL configuration
+dsrl:
+  # Path to pretrained (frozen) flow policy checkpoint (REQUIRED)
+  flow_ckpt: ""
+
+  # SAC hyperparameters
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  alpha_lr: 3e-4
+  # Wide MLP for high-dim noise space (Ta*act_dim = 160 for lift)
+  hidden_dims: [1024, 1024, 1024]
+  discount: 0.99
+  tau: 0.005
+  init_alpha: 0.1
+  target_entropy: "auto"  # "auto" = -noise_dim * 0.5
+  backup_entropy: true
+  noise_mag: 2.0  # TanhGaussian squashes x_0 to [-noise_mag, noise_mag]
+
+  # Training
+  total_env_steps: 1000000
+  warmup_steps: 1000           # random noise exploration before SAC updates
+  batch_size: 256
+  num_updates_per_step: 1      # gradient steps per env step
+  buffer_capacity: 1000000
+  reward_scale: 1.0
+  # Clamp Q targets to prevent bootstrap explosion. Set to ~10x expected max return.
+  q_target_clip: .inf

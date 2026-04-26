@@ -1,0 +1,15 @@
+# @package task
+defaults:
+  - lift_mh_state
+  - _self_
+
+# Dual intent: mean future EEF pose (7D) + mean future object XYZ position (3D) = 10D total.
+# EEF captures the approach phase; object captures the manipulation phase.
+intent_conditioning: true
+intent_dim: 10
+intent_key_groups:
+  - keys: ["robot0_eef_pos", "robot0_eef_quat"]
+  - keys: ["object"]
+    sub_slice: [0, 3]
+intent_predictor: true
+intent_type: mean

@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - lift_mh_state_flow_intent
+  - _self_
+
+# Config A-MIP: hierarchical MIP — intent flow + action flow, both MIP-sampled at inference.
+#
+# Intent is predicted by a flow model trained with mip_loss (2-call).
+# Action is predicted by a separate MLP flow model conditioned on obs_emb + GT intent
+# during training (teacher forcing), and on sampled intent at inference.
+# Set network.arch_variant=flow_intent_mip on the command line to select this agent.

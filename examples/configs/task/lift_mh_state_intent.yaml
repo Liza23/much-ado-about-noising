@@ -1,0 +1,9 @@
+# @package task
+defaults:
+  - lift_mh_state
+  - _self_
+
+# Intent conditioning (Config B): appends CV proxy intent (7D eef pos+quat)
+# to each obs step at runtime. Mirrors lift_ph_state_intent but for mh demos.
+intent_conditioning: true
+intent_dim: 7

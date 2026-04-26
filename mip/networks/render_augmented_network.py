@@ -3,17 +3,21 @@
 Wraps any base network (ChiTransformer, MLP, etc.) and intercepts forward calls
 to inject rendered future image conditioning between MIP step 1 and step 2.
 
-Architecture:
-  Training (single forward call per batch step):
-    1. draft_head(obs_emb) → draft_action         ← supervised by GT action (draft_loss)
-    2. renderer(state, draft_action) → future_img
-    3. future_encoder(future_img) → future_emb
-    4. fusion(cat([obs_emb, future_emb])) → obs_emb_enhanced
-    5. base_net(xs, s, t, obs_emb_enhanced) → (velocity, scalar)  ← main loss
+Two modes controlled by use_mip_draft:
 
-  Inference (two forward calls per ODE step due to MIP sampler):
-    Call 1 (s=0, act=zeros): draft_head → render → enhance → cache; base_net(label) → draft
-    Call 2 (t=0.9, act=noisy): base_net(label_cached) → refined
+  use_mip_draft=False (default, MLP mode — loss_type: vla_mip):
+    Training (single forward call per batch step):
+      1. draft_head(obs_emb) → draft_action         ← supervised by GT action (draft_loss)
+      2. renderer(state, draft_action) → future_img
+      3. future_encoder(future_img) → future_emb
+      4. fusion(cat([obs_emb, future_emb])) → obs_emb_enhanced
+      5. base_net(xs, s, t, obs_emb_enhanced) → (velocity, scalar)  ← main loss
+
+  use_mip_draft=True (MIP mode — loss_type: mip_render):
+    Training (two forward calls per batch step):
+      Call 1 (s=0, zeros): base_net(original_obs) → velocity (draft) → render → cache
+      Call 2 (t_two_step, noisy): base_net(cached_enhanced_obs) → refined velocity
+    No separate MLP draft head; flow model's Step 1 IS the draft.
 
 The future image encoder is a separate ResNet18 (independent weights) with the same
 architecture as the ResNet18 backbone inside the main MultiImageObsEncoder.
@@ -70,26 +74,30 @@ class RenderAugmentedNetwork(nn.Module):
     encoder's backbone) with independent weights, followed by a Linear projection
     and a fusion layer.
 
-    A separate draft_head MLP predicts the action from obs_emb; this is supervised
-    by GT action (draft_loss) and its output is used for rendering—NOT the velocity
-    field output of the base network.
+    use_mip_draft=False (default): MLP draft_head predicts action from obs_emb;
+      supervised by GT action (draft_loss). Used with loss_type: vla_mip.
+    use_mip_draft=True: Flow model's Step 1 (s=0, zeros) IS the draft; no MLP head.
+      Used with loss_type: mip_render. Two full network passes per training step.
     """
 
     def __init__(self, base_network: nn.Module, obs_dim: int, act_dim: int,
-                 future_image_size: int = 96, use_group_norm: bool = True):
+                 future_image_size: int = 96, use_group_norm: bool = True,
+                 use_mip_draft: bool = False):
         super().__init__()
         self.base_network = base_network
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.future_image_size = future_image_size  # stored for reference/logging
+        self.use_mip_draft = use_mip_draft
 
-        # Draft head: obs_emb → draft action (not the velocity field!)
-        # Supervised by GT action via draft_loss; output used for rendering.
-        self.draft_head = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.GELU(),
-            nn.Linear(256, act_dim),
-        )
+        if not use_mip_draft:
+            # Draft head: obs_emb → draft action (not the velocity field!)
+            # Supervised by GT action via draft_loss; output used for rendering.
+            self.draft_head = nn.Sequential(
+                nn.Linear(obs_dim, 256),
+                nn.GELU(),
+                nn.Linear(256, act_dim),
+            )
 
         # Future image encoder: ResNet18 → Linear(512, obs_dim)
         # Same architecture as main MultiImageObsEncoder backbone; independent weights
@@ -104,12 +112,12 @@ class RenderAugmentedNetwork(nn.Module):
 
         # Per-batch data (set before each forward pass)
         self._render_state = None       # [B, To, 5] raw pixel coords
-        self._render_action_gt = None   # [B, act_dim] GT action (normalized) for draft loss
+        self._render_action_gt = None   # [B, act_dim] GT action (normalized) for draft loss (MLP mode only)
 
         # Cache: built on call 1 during inference, consumed on call 2, cleared before each batch
         self._cache = None
 
-        # Draft loss (picked up by update_impl)
+        # Draft loss (picked up by update_impl; only set in MLP mode)
         self._draft_loss = None
 
     # ------------------------------------------------------------------
@@ -149,13 +157,14 @@ class RenderAugmentedNetwork(nn.Module):
                 label: torch.Tensor):
         """Forward pass with render augmentation.
 
-        During training (single call per batch): always computes draft → render →
-        enhance, then passes label_enhanced to base_network. This is the key fix:
-        label_enhanced IS used in the main loss computation.
+        MLP mode (use_mip_draft=False):
+          Training: draft_head → render → enhance → base_net(enhanced_obs)
+          Inference call 1: same as training, then cache enhanced obs
+          Inference call 2: base_net(cached_enhanced_obs)
 
-        During inference (two calls per ODE step via MIP sampler):
-          Call 1 (cache is None): draft → render → enhance → cache; return base_net output
-          Call 2 (cache exists): use cached label_enhanced; return base_net output
+        MIP mode (use_mip_draft=True):
+          Call 1 (cache=None): base_net(original_obs) → velocity (draft) → render → cache; return velocity
+          Call 2 (cache exists): base_net(cached_enhanced_obs) → refined velocity
 
         Args:
             xs:    Noisy action [B, Ta, act_dim]
@@ -167,37 +176,34 @@ class RenderAugmentedNetwork(nn.Module):
             (velocity [B, Ta, act_dim], scalar [B] or scalar)
         """
         if self._cache is not None:
-            # ---- Inference call 2: use cached enhanced obs_emb ----
+            # Call 2 (both modes): use cached enhanced obs
             return self.base_network(xs, s, t, self._cache)
 
-        # ---- Compute label_enhanced (training always lands here; inference call 1 too) ----
+        if self.use_mip_draft:
+            return self._forward_mip(xs, s, t, label)
+        else:
+            return self._forward_mlp(xs, s, t, label)
+
+    def _forward_mlp(self, xs, s, t, label):
+        """MLP draft head mode (use_mip_draft=False). Original behavior."""
         label_enhanced = label  # fallback if no renderer
 
         if self.renderer is not None and self._render_state is not None:
-            # Use the last timestep of render_state for rendering
             render_state_now = self._render_state[:, -1, :]  # [B, state_dim]
 
-            # Draft head: obs_emb → draft action (normalized)
-            # For [B, To, obs_dim] labels, use the mean over time axis for the draft head
             if label.dim() == 3:
                 label_flat = label.mean(dim=1)  # [B, obs_dim]
             else:
                 label_flat = label              # [B, obs_dim]
 
             draft_action = self.draft_head(label_flat)    # [B, act_dim]
-
-            # Unnormalize draft to world coords for rendering
             draft_pixel = self._unnormalize(draft_action.detach())  # [B, act_dim]
 
-            # Render: future image showing where agent will be
             with torch.no_grad():
                 future_img = self.renderer(render_state_now, draft_pixel)  # [B, 3, H, W]
 
-            # Encode future image with separate ResNet18 (same arch, independent weights)
             future_emb = self.future_encoder(future_img)     # [B, obs_dim]
 
-            # Fuse current obs + future obs
-            # label may be [B, obs_dim] (ChiTransformer) or [B, To, obs_dim] (ChiUNet)
             if label.dim() == 3:
                 future_emb_exp = future_emb.unsqueeze(1).expand_as(label)
                 label_enhanced = self.fusion(
@@ -208,18 +214,53 @@ class RenderAugmentedNetwork(nn.Module):
                     torch.cat([label, future_emb], dim=-1)
                 )                                             # [B, obs_dim]
 
-            # Draft supervision: MSE(draft_action, GT_action)
             if self._render_action_gt is not None:
                 self._draft_loss = F.mse_loss(
                     draft_action,
                     self._render_action_gt.float(),
                 )
 
-        # Cache enhanced obs for inference call 2
         self._cache = label_enhanced
-
-        # Main forward with enhanced label (key fix: was using original label before)
         return self.base_network(xs, s, t, label_enhanced)
+
+    def _forward_mip(self, xs, s, t, label):
+        """MIP-style draft mode (use_mip_draft=True).
+
+        Call 1: run base_net with original obs → use velocity as draft for rendering
+                → cache enhanced obs; return call-1 velocity (trained on original obs).
+        Call 2: handled by the cache branch in forward().
+        """
+        # Call 1: base_net with original obs
+        velocity, scalar = self.base_network(xs, s, t, label)
+
+        if self.renderer is not None and self._render_state is not None:
+            render_state_now = self._render_state[:, -1, :]  # [B, state_dim]
+
+            # Flow model's own Step 1 output IS the draft
+            # velocity: [B, Ta, act_dim] → mean over Ta → [B, act_dim]
+            draft_action = velocity.detach().mean(dim=1)
+            draft_pixel = self._unnormalize(draft_action)    # [B, act_dim]
+
+            with torch.no_grad():
+                future_img = self.renderer(render_state_now, draft_pixel)  # [B, 3, H, W]
+
+            future_emb = self.future_encoder(future_img)     # [B, obs_dim]
+
+            if label.dim() == 3:
+                future_emb_exp = future_emb.unsqueeze(1).expand_as(label)
+                label_enhanced = self.fusion(
+                    torch.cat([label, future_emb_exp], dim=-1)
+                )                                             # [B, To, obs_dim]
+            else:
+                label_enhanced = self.fusion(
+                    torch.cat([label, future_emb], dim=-1)
+                )                                             # [B, obs_dim]
+        else:
+            label_enhanced = label
+
+        self._cache = label_enhanced
+        # Return call-1 velocity (original obs); call 2 will use cached enhanced obs
+        return velocity, scalar
 
     # ------------------------------------------------------------------
     # Helpers
@@ -261,7 +302,9 @@ class RenderAugmentedNetwork(nn.Module):
         new_obj.obs_dim = self.obs_dim
         new_obj.act_dim = self.act_dim
         new_obj.future_image_size = self.future_image_size
-        new_obj.draft_head = copy.deepcopy(self.draft_head, memo)
+        new_obj.use_mip_draft = self.use_mip_draft
+        if not self.use_mip_draft:
+            new_obj.draft_head = copy.deepcopy(self.draft_head, memo)
         new_obj.future_encoder = copy.deepcopy(self.future_encoder, memo)
         new_obj.fusion = copy.deepcopy(self.fusion, memo)
 

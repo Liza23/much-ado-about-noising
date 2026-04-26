@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import pickle
 import sys
@@ -425,7 +426,7 @@ def fig_metrics_table(all_metrics: dict, out_dir: Path, task_name: str):
 
 def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict,
                          out_dir: Path, task_name: str, dt=0.1, vel_dims=7,
-                         abs_action=False, include_umap_ghosts=False):
+                         abs_action=False, include_umap_ghosts=False, n_cols=None):
     """Side-by-side 3D ghost plots for each variant at one critical state.
 
     Fits a single global PCA across all variants so the projections are comparable.
@@ -529,9 +530,12 @@ def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict
         if not family_variants:
             return None
 
-        fig = plt.figure(figsize=(5 * len(family_variants), 5))
+        n_panels = len(family_variants)
+        _nc = n_cols or n_panels
+        _nr = math.ceil(n_panels / _nc)
+        fig = plt.figure(figsize=(5 * _nc, 5 * _nr))
         for ci, var in enumerate(family_variants):
-            ax = fig.add_subplot(1, len(family_variants), ci + 1, projection="3d")
+            ax = fig.add_subplot(_nr, _nc, ci + 1, projection="3d")
             _plot_variant_panel(
                 ax, projector, axis_prefix, var, point_cloud_only=point_cloud_only
             )
@@ -693,9 +697,12 @@ def fig_ghost_comparison(variant_data: dict, state_idx: int, critical_meta: dict
         projector, axis_prefix: str, title_suffix: str, file_name: str,
         point_cloud_only: bool = False,
     ) -> Path:
-        fig = plt.figure(figsize=(5 * len(variants), 5))
+        n_panels = len(variants)
+        _nc = n_cols or n_panels
+        _nr = math.ceil(n_panels / _nc)
+        fig = plt.figure(figsize=(5 * _nc, 5 * _nr))
         for ci, var in enumerate(variants):
-            ax = fig.add_subplot(1, len(variants), ci + 1, projection="3d")
+            ax = fig.add_subplot(_nr, _nc, ci + 1, projection="3d")
             _plot_variant_panel(
                 ax, projector, axis_prefix, var, point_cloud_only=point_cloud_only
             )
@@ -761,6 +768,10 @@ def main():
     )
     parser.add_argument("--n-ghost-states", type=int, default=5,
                         help="Number of top critical states to render ghost plots for")
+    parser.add_argument("--labels", nargs="+", default=None,
+                        help="Subset of variant labels to include (default: all)")
+    parser.add_argument("--n-cols", type=int, default=None,
+                        help="Columns per row in ghost plots (default: all in one row)")
     parser.add_argument(
         "--include-umap-ghosts",
         action="store_true",
@@ -793,6 +804,8 @@ def main():
     variants = [k for k in task_data
                 if isinstance(task_data[k], dict)
                 and "critical_samples" in task_data[k]]
+    if args.labels is not None:
+        variants = [v for v in args.labels if v in variants]
     n_critical = len(critical["timestep"])
 
     print(f"Task: {args.task}")
@@ -873,6 +886,7 @@ def main():
                 variant_data, si, critical, ghost_dir, args.task,
                 dt=args.dt, vel_dims=args.vel_dims, abs_action=args.abs_action,
                 include_umap_ghosts=args.include_umap_ghosts,
+                n_cols=args.n_cols,
             )
 
     # ── Save clustering results CSV ───────────────────────────────────────────

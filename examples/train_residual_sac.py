@@ -165,6 +165,7 @@ def main(raw_cfg: DictConfig) -> None:
     device = config.optimization.device
     set_seed(config.optimization.seed)
     loguru.logger.info(f"Config:\n{OmegaConf.to_yaml(raw_cfg)}")
+    config.log.log_dir = cfg_dict["log"]["log_dir"]
 
     # ---- Dataset + Environment (auto-selects LIBERO vs robomimic) ----------
     dataset, envs = _make_dataset_and_envs(config)
@@ -174,6 +175,10 @@ def main(raw_cfg: DictConfig) -> None:
     # ---- Frozen flow-intent -----------------------------------------------
     flow_intent_ckpt = sac_cfg_dict["flow_intent_ckpt"]
     assert flow_intent_ckpt, "residual_sac.flow_intent_ckpt must be set"
+
+    # Set obs_dim from actual dataset so the encoder matches the checkpoint
+    base_obs_dim = dataset[0]["obs"]["state"].shape[-1]
+    config.task.obs_dim = base_obs_dim
 
     # The flow-intent agent needs the full MIP config for architecture.
     # We reuse the same config (task + network) that was used for pretraining.

@@ -131,7 +131,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
     # lr scheduler
     # Config A exposes intent_optimizer (encoder + intent flow).
     # Config B exposes optimizer (encoder + flow map).
-    _main_opt = agent.intent_optimizer if arch_variant == "flow_intent" else agent.optimizer
+    _main_opt = agent.intent_optimizer if arch_variant.startswith("flow_intent") else agent.optimizer
     lr_scheduler = CosineAnnealingLR(
         _main_opt,
         T_max=config.optimization.gradient_steps,
@@ -139,7 +139,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
     # Config A also needs a scheduler for the separate action_optimizer.
     action_lr_scheduler = (
         CosineAnnealingLR(agent.action_optimizer, T_max=config.optimization.gradient_steps)
-        if arch_variant == "flow_intent" else None
+        if arch_variant.startswith("flow_intent") else None
     )
 
     # Intent predictor optimizer (trained jointly with the policy).
@@ -175,7 +175,12 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
     if resume_state is not None:
         start_step = resume_state.get("n_gradient_step", 0) + 1
         best_metrics = resume_state.get("best_metrics", {})
-        eval_history = resume_state.get("eval_history", [])
+        raw_history = resume_state.get("eval_history", [])
+        # Strip any non-primitive values (e.g. wandb.Image) that can't be pickled on re-save.
+        eval_history = [
+            {k: v for k, v in entry.items() if isinstance(v, (int, float, bool, str))}
+            for entry in raw_history
+        ]
         loguru.logger.info(f"Resuming training from step {start_step}")
         loguru.logger.info(f"Restored best metrics: {best_metrics}")
 
@@ -244,7 +249,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                     # MultiImageObsEncoder processes it as an additional low_dim input via shape_meta.
                     if (getattr(config.task, "intent_conditioning", False)
                             and "intent" in batch
-                            and arch_variant != "flow_intent"):
+                            and not arch_variant.startswith("flow_intent")):
                         training_mode = getattr(config.task, "intent_training_mode", "independent")
                         _lowdim_parts = [obs_dict[k] for k in dataset.lowdim_keys]
                         # Overwrite base_obs with lowdim-only tensor for predictor input.
@@ -294,7 +299,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                     #   never appends intent to obs; it handles intent via a flow model.
                     if (getattr(config.task, "intent_conditioning", False)
                             and "intent" in batch
-                            and arch_variant != "flow_intent"):
+                            and not arch_variant.startswith("flow_intent")):
                         training_mode = getattr(config.task, "intent_training_mode", "independent")
 
                         # encoded_mean pre-processing: encode per-step sequence → mean-pool.
@@ -335,7 +340,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
 
                 # Inject render state for render-augmented training (Config B only).
                 # Config A (FlowIntentAgent) has no flow_map / get_net().
-                net = get_net(agent) if arch_variant != "flow_intent" else None
+                net = get_net(agent) if not arch_variant.startswith("flow_intent") else None
                 if net is not None and hasattr(net, 'set_render_data') and "render_state" in batch:
                     render_state = batch["render_state"].to(config.optimization.device)
                     # GT action at step 0 (normalized) for draft_head supervision
@@ -353,7 +358,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                 delta_t = torch.full(
                     (batch_size,), delta_t_scalar, device=config.optimization.device
                 )
-                if arch_variant == "flow_intent":
+                if arch_variant.startswith("flow_intent"):
                     # Config A: agent handles both flow-intent and MLP-action updates.
                     # Use base_obs (no intent appended); GT intent passed explicitly.
                     _intent_gt = batch["intent"].to(config.optimization.device)
@@ -460,7 +465,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
             # Update best metrics and average metrics
             old_best_metrics = best_metrics.copy()
             best_metrics = update_best_metrics(best_metrics, metrics)
-            eval_history.append(metrics.copy())
+            # Strip wandb.Image objects before storing — they hold a wandb Run reference
+            # that can't be pickled by torch.save (causes AttributeError in __getstate__).
+            eval_history.append({k: v for k, v in metrics.items() if isinstance(v, (int, float, bool, str))})
             avg_metrics = compute_average_metrics(eval_history)
 
             # Check if this is a new best model based on success rate
@@ -491,8 +498,10 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                         checkpoint_base_name += "_render"
                     if getattr(config.task, 'intent_conditioning', False):
                         checkpoint_base_name += "_intent"
-                    if arch_variant == "flow_intent":
+                    if arch_variant.startswith("flow_intent"):
                         checkpoint_base_name += "_flow_intent"  # Config A
+                        if arch_variant == "flow_intent_mip":
+                            checkpoint_base_name += "_mip"
                     else:
                         if getattr(config.task, 'intent_predictor', False):
                             checkpoint_base_name += "_learned"
@@ -500,6 +509,8 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                             checkpoint_base_name += "_joint"
                     if getattr(config.task, 'intent_type', 'mean') == 'encoded_mean':
                         checkpoint_base_name += "_emb"  # encoded_mean has different model shapes
+                    if getattr(config.task, 'intent_key_groups', None) is not None:
+                        checkpoint_base_name += "_dual"
                     training_state = {
                         "n_gradient_step": n_gradient_step,
                         "best_metrics": best_metrics,
@@ -758,7 +769,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
                     # Config B: use learned predictor or CV proxy then append to obs.
                     # Config A: FlowIntentAgent samples intent internally via ODE;
                     #           obs is passed without any intent appended.
-                    if getattr(config.task, "intent_conditioning", False) and arch_variant != "flow_intent":
+                    if getattr(config.task, "intent_conditioning", False) and not arch_variant.startswith("flow_intent"):
                         if intent_predictor is not None:
                             # Learned predictor: MLP trained to predict intent in embedding space.
                             # For encoded_mean the predictor directly outputs (num_envs, intent_emb_dim).
@@ -815,7 +826,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
 
                     # Image intent conditioning at eval (Config B only).
                     # Config A (FlowIntentAgent) samples intent internally — obs passed as-is.
-                    if getattr(config.task, "intent_conditioning", False) and arch_variant != "flow_intent":
+                    if getattr(config.task, "intent_conditioning", False) and not arch_variant.startswith("flow_intent"):
                         _lowdim_parts_eval = [obs[k] for k in dataset.lowdim_keys]
                         lowdim_tensor = torch.cat(_lowdim_parts_eval, dim=-1)
                         # (num_envs, obs_steps, lowdim_dim)
@@ -848,7 +859,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
             # Inject current sim states into RenderAugmentedNetwork so renders
             # happen at eval time (same conditioning distribution as training).
             # Config A (FlowIntentAgent) has no flow_map_ema / get_ema_net().
-            ema_net = get_ema_net(agent) if arch_variant != "flow_intent" else None
+            ema_net = get_ema_net(agent) if not arch_variant.startswith("flow_intent") else None
             if ema_net is not None and hasattr(ema_net, 'set_render_data') and hasattr(envs, 'envs'):
                 sim_states = [_get_sim_state(e) for e in envs.envs]
                 # Only inject if ALL envs succeeded — partial batches cause a shape
@@ -865,7 +876,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
 
             # run sampling (num_envs, horizon, action_dim)
             with timed("sample", inference_times):
-                if arch_variant == "flow_intent":
+                if arch_variant.startswith("flow_intent"):
                     # Config A: FlowIntentAgent samples intent then decodes action.
                     # State obs: obs_tensor (num_envs, obs_steps, base_obs_dim) — no intent appended.
                     # Image obs: obs dict (TensorDict-compatible) — no "intent" key added.
@@ -892,7 +903,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
                 _multi_samples = []
                 with torch.no_grad():
                     for _ in range(_MULTI_K):
-                        if arch_variant == "flow_intent":
+                        if arch_variant.startswith("flow_intent"):
                             # Config A: each call draws fresh intent noise → different action.
                             _an_k = agent.sample(
                                 obs=obs_tensor, use_ema=True, num_steps=num_steps,
@@ -1088,7 +1099,7 @@ def main(config):
             # For sequence intent, effective intent_dim = N steps × 7D eef per step
             if _intent_type_main == "sequence":
                 config.task.intent_dim = config.task.intent_horizon * 7
-            if _arch_variant_main != "flow_intent":
+            if not _arch_variant_main.startswith("flow_intent"):
                 # Config B only: bump obs_dim to include intent conditioning dims.
                 # For encoded_mean the conditioning vector has size intent_emb_dim (not raw intent_dim).
                 _cond_dim = (
@@ -1127,7 +1138,7 @@ def main(config):
     ):
         single_env = envs.envs[0]  # MultiStepWrapper (renderer unwraps further)
 
-    if _arch_variant_main == "flow_intent":
+    if _arch_variant_main.startswith("flow_intent"):
         # Config A: flow intent model + deterministic MLP action decoder.
         # No env needed (no renderer).
         agent = FlowIntentAgent(config)
@@ -1139,7 +1150,7 @@ def main(config):
     # can unnormalize draft actions to world coords for rendering. EMA deepcopy resets
     # action_normalizer to None (not parametric), so must be injected separately.
     # Config A (FlowIntentAgent) has no flow_map / get_net(), so skip this block.
-    if _arch_variant_main != "flow_intent":
+    if not _arch_variant_main.startswith("flow_intent"):
         for net_or_ema in (get_net(agent), get_ema_net(agent)):
             if hasattr(net_or_ema, 'set_action_normalizer'):
                 net_or_ema.set_action_normalizer(dataset.normalizer["action"])
@@ -1153,7 +1164,7 @@ def main(config):
     intent_encoder = None  # only used for Config B + intent_type=="encoded_mean"
     if (getattr(config.task, "intent_conditioning", False)
             and getattr(config.task, "intent_predictor", False)
-            and _arch_variant_main != "flow_intent"):
+            and not _arch_variant_main.startswith("flow_intent")):
         if config.task.obs_type == "state":
             _base_obs_dim = base_obs_dim
         else:
@@ -1218,8 +1229,10 @@ def main(config):
             checkpoint_base_name += "_render"
         if getattr(config.task, 'intent_conditioning', False):
             checkpoint_base_name += "_intent"
-        if _arch_variant_main == "flow_intent":
+        if _arch_variant_main.startswith("flow_intent"):
             checkpoint_base_name += "_flow_intent"  # Config A distinguisher
+            if _arch_variant_main == "flow_intent_mip":
+                checkpoint_base_name += "_mip"
         else:
             if getattr(config.task, 'intent_predictor', False):
                 checkpoint_base_name += "_learned"
@@ -1227,6 +1240,8 @@ def main(config):
                 checkpoint_base_name += "_joint"
         if getattr(config.task, 'intent_type', 'mean') == 'encoded_mean':
             checkpoint_base_name += "_emb"  # encoded_mean has different model shapes
+        if getattr(config.task, 'intent_key_groups', None) is not None:
+            checkpoint_base_name += "_dual"
         # Prefer model_latest.pt in the run's log dir (has full training state)
         model_latest_path = logger.model_dir / "model_latest.pt"
         if model_latest_path.exists():

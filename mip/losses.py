@@ -49,6 +49,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return mf_loss
     elif loss_type == "vla_mip":
         return vla_mip_loss
+    elif loss_type == "mip_render":
+        return mip_render_loss
     else:
         raise NotImplementedError(f"Loss type {loss_type} not implemented.")
 
@@ -277,6 +279,44 @@ def vla_mip_loss(
     loss = get_norm((act_pred - act) / (1 - config.t_two_step), config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
 
+    return loss, {}
+
+
+def mip_render_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """MIP loss with render-augmented refinement (use_mip_draft=True).
+
+    Call 1 (s=0, zeros): flow map predicts draft → triggers render inside network
+      → caches enhanced obs. Supervised on original obs.
+    Call 2 (t_two_step, noisy): flow map refines using cached enhanced obs.
+
+    No separate MLP draft head; the flow model's Step 1 IS the draft.
+    Equivalent compute to standard mip_loss (two full network passes).
+    """
+    s = torch.zeros_like(delta_t)
+    t = torch.zeros_like(delta_t) + config.t_two_step
+    act_0 = torch.zeros_like(act)
+    noise = torch.empty_like(act).normal_(0, 1)
+    act_t = act + (1 - config.t_two_step) * noise
+
+    obs_emb = encoder(obs, None)
+
+    # Call 1: s=0, zeros → draft velocity; render fires inside network, enhanced obs cached
+    act_pred_0 = flow_map.get_velocity(s, act_0, obs_emb)
+
+    # Call 2: t_two_step, noisy act → refined velocity using cached enhanced obs
+    act_pred_1 = flow_map.get_velocity(t, act_t, obs_emb)
+
+    loss0 = get_norm((act_pred_0 - act) / config.t_two_step, config.norm_type)
+    loss1 = get_norm((act_pred_1 - act) / (1 - config.t_two_step), config.norm_type)
+    loss = config.loss_scale * torch.mean(loss0 + loss1)
     return loss, {}
 
 

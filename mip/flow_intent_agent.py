@@ -129,12 +129,15 @@ class FlowIntentAgent:
         self.intent_flow_map_ema = deepcopy(self.intent_flow_map).requires_grad_(False)
         report_parameters(self.intent_flow_map, model_name="Flow Intent Model [Config A]")
 
-        # ── Action model: MLP decoder OR ChiUNet flow map ────────────────
+        # ── Action model: MLP decoder OR ChiUNet flow map OR MIP flow map ──
         # Gated by arch_variant:
         #   "flow_intent"        → deterministic MLPActionDecoder (original Config A)
         #   "flow_intent_chiunet"→ ChiUNet FlowMap conditioned on obs_emb ⊕ intent
+        #   "flow_intent_mip"    → MLP FlowMap conditioned on obs_emb ⊕ intent,
+        #                          intent trained with mip_loss, MIP sampled at inference
         self._arch_variant = config.network.arch_variant
         self._use_chiunet_action = self._arch_variant == "flow_intent_chiunet"
+        self._use_mip_action = self._arch_variant == "flow_intent_mip"
 
         if self._use_chiunet_action:
             # ── ChiUNet action flow map ──────────────────────────────────
@@ -164,6 +167,36 @@ class FlowIntentAgent:
             # to flow_loss without any additional transformation.
             self._identity_encoder = IdentityEncoder().to(device)
             self._action_loss_fn = get_loss_fn("flow")
+
+            self.action_decoder = None
+            self.action_decoder_ema = None
+            _action_optimizer_params = list(self.action_flow_map.parameters())
+        elif self._use_mip_action:
+            # ── MLP action flow map (MIP-style) ─────────────────────────
+            # Same conditioning as ChiUNet variant (obs_emb ⊕ intent) but uses
+            # standard MLP network.  Intent is trained with mip_loss; action with
+            # flow_loss (teacher-forced on GT intent).  MIP sampler at inference.
+            #
+            # get_network() ignores task_config.obs_dim and always uses
+            # network_config.emb_dim for MLPs.  We need obs_dim = emb_dim + intent_dim,
+            # so we instantiate the MLP directly.
+            from mip.networks.mlp import MLP as _MLP
+            _action_obs_dim = config.network.emb_dim + effective_intent_dim
+            action_net = _MLP(
+                act_dim=config.task.act_dim,
+                Ta=config.task.horizon,
+                obs_dim=_action_obs_dim,
+                To=config.task.obs_steps,
+                emb_dim=config.network.emb_dim,
+                n_layers=config.network.num_layers,
+                dropout=config.network.dropout,
+                timestep_emb_dim=config.network.timestep_emb_dim,
+            )
+            self.action_flow_map = FlowMap(action_net).to(device)
+            self.action_flow_map_ema = deepcopy(self.action_flow_map).requires_grad_(False)
+            report_parameters(self.action_flow_map, model_name="MLP Action FlowMap [Config A-MIP]")
+            self._identity_encoder = IdentityEncoder().to(device)
+            self._action_loss_fn = get_loss_fn("mip")
 
             self.action_decoder = None
             self.action_decoder_ema = None
@@ -210,8 +243,8 @@ class FlowIntentAgent:
         )
 
         # ── Loss / interpolant for flow intent model ──────────────────────
-        # Always "flow" regardless of config.optimization.loss_type so that
-        # the intent ODE at inference matches the training objective exactly.
+        # flow_intent / flow_intent_chiunet: "flow" loss → Euler ODE at inference.
+        # flow_intent_mip: "mip" loss for intent → MIP 2-call sampler at inference.
         self.interpolant = Interpolant(config.optimization.interp_type)
         self._intent_loss_fn = get_loss_fn("flow")
         self._decoder_train_step = 0  # incremented each update(); used for curriculum
@@ -329,7 +362,7 @@ class FlowIntentAgent:
                 )  # (B, 1, intent_dim)
                 intent_vec = intent_sampled.squeeze(1)  # (B, intent_dim)
 
-        if self._use_chiunet_action:
+        if self._use_chiunet_action or self._use_mip_action:
             # Build condition: obs_emb ⊕ intent → (B, To, emb_dim + intent_dim)
             # intent_vec is (B, intent_dim); expand to each obs step.
             intent_expanded = intent_vec.detach().unsqueeze(1).expand(
@@ -382,7 +415,7 @@ class FlowIntentAgent:
             (self.encoder, self.encoder_ema),
             (self.intent_flow_map, self.intent_flow_map_ema),
         ]
-        if self._use_chiunet_action:
+        if self._use_chiunet_action or self._use_mip_action:
             pairs.append((self.action_flow_map, self.action_flow_map_ema))
         else:
             pairs.append((self.action_decoder, self.action_decoder_ema))
@@ -423,8 +456,8 @@ class FlowIntentAgent:
         """
         encoder = self.encoder_ema if use_ema else self.encoder
         intent_flow = self.intent_flow_map_ema if use_ema else self.intent_flow_map
-        # action_dec only used in MLP path; ChiUNet path resolves its own model inline
-        action_dec = (None if self._use_chiunet_action
+        # action_dec only used in MLP decoder path; ChiUNet and MIP paths resolve inline
+        action_dec = (None if (self._use_chiunet_action or self._use_mip_action)
                       else (self.action_decoder_ema if use_ema else self.action_decoder))
         # intent_seq_encoder is not used at inference (we sample from the flow model)
         # so it is irrelevant here regardless of intent_type.
@@ -449,9 +482,8 @@ class FlowIntentAgent:
             if obs_emb.dim() == 2:
                 obs_emb = obs_emb.unsqueeze(1)  # (B, emb_dim) → (B, 1, emb_dim)
 
-            # 2. Sample intent via ODE in intent space (Ta=1, D=effective_intent_dim)
-            #    For encoded_mean, D=intent_emb_dim; for raw types, D=intent_dim.
-            #    We bypass the standard ode_sampler to avoid a redundant encoder call.
+            # 2. Sample intent via ODE/MIP in intent space (Ta=1, D=effective_intent_dim)
+            #    We bypass the standard sampler to avoid a redundant encoder call.
             _eff_dim = (
                 getattr(self.config.task, "intent_emb_dim", self.config.task.intent_dim)
                 if self._intent_type == "encoded_mean"
@@ -475,6 +507,14 @@ class FlowIntentAgent:
                     B, self.config.task.horizon, self.config.task.act_dim, device=device
                 )
                 action = self._run_action_ode(cfg, action_flow, action_condition, action_noise)
+            elif self._use_mip_action:
+                # MIP 2-call for action: zeros → draft action → refined action
+                intent_expanded = intent_vec.unsqueeze(1).expand(
+                    -1, self.config.task.obs_steps, -1
+                )
+                action_condition = torch.cat([obs_emb, intent_expanded], dim=-1)
+                action_flow = self.action_flow_map_ema if use_ema else self.action_flow_map
+                action = self._run_action_mip(cfg, action_flow, action_condition)
             else:
                 #    Shape: obs_emb (B, obs_steps, emb_dim), intent (B, intent_dim)
                 action = action_dec(obs_emb, intent_vec)  # (B, horizon, act_dim)
@@ -482,6 +522,71 @@ class FlowIntentAgent:
         if return_intent:
             return action, intent_vec
         return action
+
+    def sample_with_intent_noise(
+        self,
+        obs: torch.Tensor,          # (B, obs_steps, base_obs_dim)
+        intent_noise: torch.Tensor, # (B, 1, intent_dim) — chosen by DSRL actor
+        use_ema: bool = True,
+        num_steps: int = -1,
+    ) -> torch.Tensor:
+        """DSRL hook: run the intent ODE from a chosen noise, then decode action.
+
+        Replaces random intent_noise with a learned one from the SAC actor.
+        Returns action (B, horizon, act_dim).
+        """
+        encoder = self.encoder_ema if use_ema else self.encoder
+        intent_flow = self.intent_flow_map_ema if use_ema else self.intent_flow_map
+        action_dec = (None if (self._use_chiunet_action or self._use_mip_action)
+                      else (self.action_decoder_ema if use_ema else self.action_decoder))
+        cfg = deepcopy(self.config.optimization)
+        if num_steps >= 1:
+            cfg.num_steps = int(num_steps)
+
+        with torch.no_grad():
+            obs_emb = encoder(obs, None)
+            if obs_emb.dim() == 2:
+                obs_emb = obs_emb.unsqueeze(1)
+            intent_sampled = self._run_intent_ode(cfg, intent_flow, obs_emb, intent_noise)
+            intent_vec = intent_sampled.squeeze(1)  # (B, intent_dim)
+
+            if self._use_chiunet_action:
+                intent_expanded = intent_vec.unsqueeze(1).expand(-1, self.config.task.obs_steps, -1)
+                action_condition = torch.cat([obs_emb, intent_expanded], dim=-1)
+                action_flow = self.action_flow_map_ema if use_ema else self.action_flow_map
+                action_noise = torch.randn(
+                    obs.shape[0], self.config.task.horizon, self.config.task.act_dim, device=obs.device
+                )
+                action = self._run_action_ode(cfg, action_flow, action_condition, action_noise)
+            elif self._use_mip_action:
+                intent_expanded = intent_vec.unsqueeze(1).expand(-1, self.config.task.obs_steps, -1)
+                action_condition = torch.cat([obs_emb, intent_expanded], dim=-1)
+                action_flow = self.action_flow_map_ema if use_ema else self.action_flow_map
+                action = self._run_action_mip(cfg, action_flow, action_condition)
+            else:
+                action = action_dec(obs_emb, intent_vec)
+
+        return action
+
+    def sample_intent_from_noise(
+        self,
+        obs: torch.Tensor,
+        intent_noise: torch.Tensor,  # (B, 1, intent_dim) — chosen externally (e.g. DSRL actor)
+        use_ema: bool = True,
+        num_steps: int = -1,
+    ) -> torch.Tensor:
+        """Run intent ODE from a caller-supplied noise tensor. Returns (B, intent_dim)."""
+        encoder = self.encoder_ema if use_ema else self.encoder
+        intent_flow = self.intent_flow_map_ema if use_ema else self.intent_flow_map
+        cfg = deepcopy(self.config.optimization)
+        if num_steps >= 1:
+            cfg.num_steps = int(num_steps)
+        with torch.no_grad():
+            obs_emb = encoder(obs, None)
+            if obs_emb.dim() == 2:
+                obs_emb = obs_emb.unsqueeze(1)
+            intent_sampled = self._run_intent_ode(cfg, intent_flow, obs_emb, intent_noise)
+        return intent_sampled.squeeze(1)  # (B, intent_dim)
 
     def sample_intent(self, obs: torch.Tensor, use_ema: bool = True, num_steps: int = -1) -> torch.Tensor:
         """Sample an intent vector from the intent ODE given obs. Returns (B, intent_dim)."""
@@ -535,6 +640,11 @@ class FlowIntentAgent:
                     device=intent_vec.device,
                 )
                 action = self._run_action_ode(cfg, action_flow, action_condition, action_noise)
+            elif self._use_mip_action:
+                intent_expanded = intent_vec.unsqueeze(1).expand(-1, self.config.task.obs_steps, -1)
+                action_condition = torch.cat([obs_emb, intent_expanded], dim=-1)
+                action_flow = self.action_flow_map_ema if use_ema else self.action_flow_map
+                action = self._run_action_mip(cfg, action_flow, action_condition)
             else:
                 action = action_dec(obs_emb, intent_vec)
         return action
@@ -608,6 +718,31 @@ class FlowIntentAgent:
 
         return act_s  # (B, horizon, act_dim)
 
+    def _run_action_mip(
+        self,
+        cfg,
+        action_flow_map: FlowMap,
+        action_condition: torch.Tensor,  # (B, To, emb_dim + intent_dim)
+    ) -> torch.Tensor:
+        """MIP 2-call sampling for the action flow model.
+
+        Call 1: s=0, zeros  → draft action (act_pred_0)
+        Call 2: t_two_step, act_pred_0 → refined action (act_pred_1)
+
+        Returns:
+            action : (B, horizon, act_dim)
+        """
+        B = action_condition.shape[0]
+        device = action_condition.device
+        s = torch.zeros(B, device=device)
+        t = torch.full((B,), cfg.t_two_step, device=device)
+        act_0 = torch.zeros(
+            B, self.config.task.horizon, self.config.task.act_dim, device=device
+        )
+        act_pred_0 = action_flow_map.get_velocity(s, act_0, action_condition)
+        act_pred_1 = action_flow_map.get_velocity(t, act_pred_0, action_condition)
+        return act_pred_1  # (B, horizon, act_dim)
+
     # ──────────────────────────────────────────────────────────────────────
     # Mode switching
     # ──────────────────────────────────────────────────────────────────────
@@ -618,7 +753,7 @@ class FlowIntentAgent:
         self.encoder_ema.eval()
         self.intent_flow_map.eval()
         self.intent_flow_map_ema.eval()
-        if self._use_chiunet_action:
+        if self._use_chiunet_action or self._use_mip_action:
             self.action_flow_map.eval()
             self.action_flow_map_ema.eval()
         else:
@@ -634,7 +769,7 @@ class FlowIntentAgent:
         self.encoder_ema.train()
         self.intent_flow_map.train()
         self.intent_flow_map_ema.train()
-        if self._use_chiunet_action:
+        if self._use_chiunet_action or self._use_mip_action:
             self.action_flow_map.train()
             self.action_flow_map_ema.train()
         else:
@@ -658,7 +793,7 @@ class FlowIntentAgent:
             "intent_optimizer": self.intent_optimizer.state_dict(),
             "action_optimizer": self.action_optimizer.state_dict(),
         }
-        if self._use_chiunet_action:
+        if self._use_chiunet_action or self._use_mip_action:
             checkpoint["action_flow_map"] = self.action_flow_map.state_dict()
             checkpoint["action_flow_map_ema"] = self.action_flow_map_ema.state_dict()
         else:
@@ -690,7 +825,7 @@ class FlowIntentAgent:
         self.encoder_ema.load_state_dict(sd["encoder_ema"])
         self.intent_flow_map.load_state_dict(sd["intent_flow_map"])
         self.intent_flow_map_ema.load_state_dict(sd["intent_flow_map_ema"])
-        if self._use_chiunet_action:
+        if self._use_chiunet_action or self._use_mip_action:
             self.action_flow_map.load_state_dict(sd["action_flow_map"])
             self.action_flow_map_ema.load_state_dict(sd["action_flow_map_ema"])
         else:
