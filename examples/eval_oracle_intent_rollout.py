@@ -62,6 +62,7 @@ def _get_gt_intent(eval_envs, act_steps: int, eef_normalizer, device: str) -> to
 
         inner.set_state(sim_state)        # restore
         inner.env.sim.forward()
+        inner.env.done = False            # robosuite.done not reset by set_state; clear it
 
         future_eef_arr = np.stack(future_eefs, axis=0)  # (T, 6)
         all_intents.append(future_eef_arr.mean(axis=0))  # (6,)
@@ -131,6 +132,8 @@ def _run_episodes(config, eval_envs, dataset, agent, num_steps, use_oracle, imag
 
             obs, reward, terminated, truncated, info = eval_envs.step(act)
             t += act_steps
+            if np.all(terminated) or np.all(truncated):
+                break
 
             if "_final_info" in info:
                 for i in range(num_envs):

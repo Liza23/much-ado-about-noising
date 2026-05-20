@@ -709,7 +709,7 @@ def main():
     seed_start = args.seed_start
     seed_end = args.seed_end if args.seed_end is not None else seed_start + args.n_rollouts
     n_shard = seed_end - seed_start
-    is_shard = (seed_start != 0 or seed_end != args.n_rollouts)
+    is_shard = (args.seed_start != 0 or args.seed_end is not None)
     shard_pkl = out_dir / f"rollouts_{seed_start}_{seed_end}.pkl"
     full_pkl = out_dir / "rollouts.pkl"
 

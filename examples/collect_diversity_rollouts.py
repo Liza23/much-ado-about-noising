@@ -40,6 +40,7 @@ Output .pkl structure:
 import argparse
 import os
 import pickle
+import resource
 import sys
 import warnings
 from pathlib import Path
@@ -48,6 +49,10 @@ import numpy as np
 import torch
 
 os.environ.setdefault("MUJOCO_GL", "egl")
+
+# Raise fd limit as high as the hard limit allows (bash ulimit may be capped lower).
+_fd_hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+resource.setrlimit(resource.RLIMIT_NOFILE, (_fd_hard, _fd_hard))
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -72,6 +77,26 @@ from mip.torch_utils import set_seed
 from mip.residual_parl.parl_agent import ResidualPARLAgent, PARLConfig
 from mip.dsrl.dsrl_agent import DSRLSACAgent, DSRLConfig
 from mip.residual_sac.sac_agent import ResidualSACAgent, SACConfig
+
+# On compute nodes, Python's import system may resolve .venv/lib64 (a lib64->lib symlink)
+# as the canonical path, so robosuite.__file__ contains "lib64".  edit_model_xml() in
+# robosuite/environments/base.py rebuilds all mesh/texture paths from robosuite.__file__,
+# so every asset ends up with a lib64 prefix that MuJoCo's C resolver can't follow on NFS.
+#
+# Fix 1: redirect robosuite.__file__ via realpath (works if lib64->lib resolves on the node).
+import robosuite as _rs
+_rs.__file__ = os.path.realpath(_rs.__file__)
+
+# Fix 2: belt-and-suspenders — patch edit_model_xml to replace any residual lib64 prefix.
+import robosuite.environments.base as _rsb
+_venv_lib64 = str(ROOT / ".venv" / "lib64")
+_venv_lib   = str(ROOT / ".venv" / "lib")
+_EnvCls = getattr(_rsb, "EnvBase", None) or _rsb.MujocoEnv
+_orig_edit_xml = _EnvCls.edit_model_xml
+def _patched_edit_xml(self, xml_str):
+    xml_str = _orig_edit_xml(self, xml_str)
+    return xml_str.replace(_venv_lib64 + "/", _venv_lib + "/")
+_EnvCls.edit_model_xml = _patched_edit_xml
 
 
 def _is_kitchen(task_config):
@@ -634,6 +659,7 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
                 with torch.no_grad():
                     intent_proxy = intent_predictor(obs_t)  # (B, cond_dim)
             else:
+                intent_slices = getattr(dataset, "intent_slices", None)
                 intent_start = getattr(dataset, "intent_start", None)
                 intent_end = getattr(dataset, "intent_end", None)
                 if intent_start is None or intent_end is None:
@@ -641,17 +667,20 @@ def preprocess_obs(obs_raw, config, dataset, device: str, intent_predictor=None)
                         "Intent CV proxy requires dataset.intent_start/end; "
                         "provide an intent predictor or a dataset with intent indices."
                     )
-                eef_now  = obs_t[:, -1, intent_start:intent_end]
-                eef_prev = obs_t[:, -2, intent_start:intent_end]
-                velocity = eef_now - eef_prev
-                if intent_type == "sequence":
-                    ks = torch.arange(1, config.task.intent_horizon + 1,
-                                      dtype=torch.float32, device=device)
-                    future_steps = eef_now.unsqueeze(1) + ks.view(-1, 1) * velocity.unsqueeze(1)
-                    intent_proxy = future_steps.reshape(obs_t.shape[0], -1)
-                else:
-                    half_h = (config.task.intent_horizon + 1) / 2.0
-                    intent_proxy = eef_now + half_h * velocity
+                half_h = (config.task.intent_horizon + 1) / 2.0
+                proxies = []
+                for s, e in (intent_slices or [(intent_start, intent_end)]):
+                    feat_now  = obs_t[:, -1, s:e]
+                    feat_prev = obs_t[:, -2, s:e]
+                    velocity = feat_now - feat_prev
+                    if intent_type == "sequence":
+                        ks = torch.arange(1, config.task.intent_horizon + 1,
+                                          dtype=torch.float32, device=device)
+                        future_steps = feat_now.unsqueeze(1) + ks.view(-1, 1) * velocity.unsqueeze(1)
+                        proxies.append(future_steps.reshape(obs_t.shape[0], -1))
+                    else:
+                        proxies.append(feat_now + half_h * velocity)
+                intent_proxy = torch.cat(proxies, dim=-1)
 
             intent_expanded = intent_proxy.unsqueeze(1).expand(-1, config.task.obs_steps, -1)
             obs_t = torch.cat([obs_t, intent_expanded], dim=-1)

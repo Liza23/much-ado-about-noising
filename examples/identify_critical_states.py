@@ -1,9 +1,15 @@
-"""Identify critical vs redundant states via observation noise injection.
+"""Identify critical vs redundant states via physical state perturbation.
 
-For each timestep in reference rollouts, adds Gaussian noise to the policy's
-(normalized) observation and re-runs the episode forward. States where noising
-causes irreversible failure are "critical"; states where the policy self-corrects
-are "redundant".
+For each timestep in reference rollouts, add Gaussian noise to the robot's
+joint angles in the MuJoCo sim state, restore the env to that perturbed
+physical state, then roll out with CLEAN policy observations.
+
+  Recovery → "redundant state": the policy self-corrects from nearby configs.
+  Failure  → "critical state" : the policy cannot recover from small deviations.
+
+This tests which physical arm configurations are in the basin of attraction
+of the policy — a well-defined question independent of BC's lack of a recovery
+mechanism from obs-space noise.
 
 Algorithm
 ---------
@@ -14,36 +20,37 @@ Phase 1 — Reference rollouts
     timestep   : episode step counter
     eef_pos    : EEF xyz for visualization
 
-Phase 2 — Noisy re-rollouts
+Phase 2 — Perturbed re-rollouts
   For each saved (sim_state, obs_buf, t), repeat n_noisy times:
-    1. Restore env to sim_state
-    2. Preprocess obs_buf → normalized obs tensor via to_fi_obs
-    3. Inject Gaussian noise:  fi_obs_noisy = fi_obs + randn(same shape) * noise_std
-    4. Sample ONE action chunk from the policy using the noisy obs
-    5. Execute that action chunk in the real env
-    6. Continue rollout for the rest of n_future_steps with CLEAN observations
-    7. Record success / failure
+    1. Add Gaussian noise to robot arm joint angles (qpos[0:n_arm_joints])
+       in the saved sim_state. Units: radians (or metres for prismatic joints).
+    2. Restore env to perturbed sim_state via reset_to{"states": ...}.
+    3. Run the full remaining horizon with CLEAN policy observations.
+    4. Record success / failure.
 
-Noise magnitude (noise_std) is in the normalized observation space (approx [-1,1]).
-Typical values: 0.1 (subtle), 0.3 (moderate), 0.5 (strong).
+noise_std values in joint-space radians:
+  0.02 rad (~1°) : very subtle perturbation
+  0.05 rad (~3°) : subtle
+  0.10 rad (~6°) : moderate
+  0.20 rad (~11°): strong
 
 Output pkl
 ----------
 {
   "noise_std": float,
   "n_noisy": int,
-  "n_future_steps": int,
+  "n_arm_joints": int,
   "label": str,
   "states": [
     {
       "episode": int,
       "timestep": int,
       "eef_pos": np.ndarray (3,),
-      "sim_state": np.ndarray,        # full MuJoCo state
+      "sim_state": np.ndarray,        # full MuJoCo state (unperturbed)
       "n_noisy": int,
       "n_success": int,
       "recovery_rate": float,         # n_success / n_noisy
-      "outcomes": list[bool],         # per noisy rollout
+      "outcomes": list[bool],
     },
     ...
   ]
@@ -54,13 +61,13 @@ Usage
     # Baseline BC model
     python examples/identify_critical_states.py \\
         --run "baseline:checkpoints/lift_mh_state_flow_mlp_512_h10_seed0.pt:task=lift_mh_state" \\
-        --n-rollouts 20 --n-noisy 10 --noise-std 0.3 --n-future-steps 100 \\
+        --n-rollouts 20 --n-noisy 10 --noise-std 0.05 \\
         --device cuda --out rollouts/critical_states_lift_mh_baseline.pkl
 
     # Flow-intent model
     python examples/identify_critical_states.py \\
         --run "flow_intent:checkpoints/lift_mh_fi.pt:task=lift_mh_state_flow_intent:network=mlp_flow_intent" \\
-        --n-rollouts 20 --n-noisy 10 --noise-std 0.3 --n-future-steps 100 \\
+        --n-rollouts 20 --n-noisy 10 --noise-std 0.05 \\
         --device cuda --out rollouts/critical_states_lift_mh_fi.pkl
 
     # Analyze saved results
@@ -121,15 +128,36 @@ from mip.torch_utils import set_seed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Physical state perturbation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def perturb_sim_state(sim_state, noise_std, n_arm_joints=7, rng=None):
+    """Add Gaussian noise to robot arm joint angles in sim_state.
+
+    sim_state: flat numpy array [qpos | qvel]. For Panda + single object:
+      qpos[0:7]   — arm joint angles (radians)
+      qpos[7:9]   — gripper fingers (left untouched — sensitive)
+      qpos[9:12]  — object xyz position
+      qpos[12:16] — object quaternion
+      qvel[...]   — velocities (left at current values)
+
+    noise_std: std dev in radians (for revolute joints). Typical: 0.05=subtle.
+    n_arm_joints: number of arm joints to noise (default 7 for Panda).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    noised = sim_state.copy()
+    noised[:n_arm_joints] += rng.standard_normal(n_arm_joints) * noise_std
+    return noised
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Reference rollout: collect (sim_state, obs_buf, t) at each chunk boundary
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_reference_states(config, agent, dataset, envs, args, device):
     """Run n_rollouts episodes and save env state at every chunk boundary.
 
-    Saves all timesteps that have at least one act_steps chunk remaining.
-    The noisy re-rollout uses the full remaining horizon (max_episode_steps - t),
-    so there is no need to filter by n_future_steps here.
     Returns a list of dicts: {obs_buf, sim_state, timestep, episode, eef_pos}.
     """
     num_steps = 9
@@ -186,14 +214,13 @@ def collect_reference_states(config, agent, dataset, envs, args, device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Noisy re-rollout: inject noise at step 0, run clean afterwards
+# Clean rollout from restored (possibly perturbed) env state
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_noisy_rollout(
-    envs, obs_buf, agent, config, dataset, device, noise_std, n_future_steps, num_steps=9,
-):
-    """Restore env, inject obs noise for the FIRST chunk only, then roll out cleanly.
+def run_clean_rollout(envs, obs_buf, agent, config, dataset, device, n_future_steps, num_steps=9):
+    """Run policy forward from current env state using clean observations.
 
+    The env must already be restored to the desired physical state before calling.
     Returns dict with keys: success (bool), n_steps (int).
     """
     s = config.task.obs_steps - 1
@@ -202,35 +229,12 @@ def run_noisy_rollout(
     done = False
     info = {}
     steps_run = 0
-
-    # ── Chunk 0: noisy observation ────────────────────────────────────────────
-    fi_obs, _ = to_fi_obs(obs_buf, config, dataset, device)
-    # noise injected in normalized obs space
-    noise = torch.randn_like(fi_obs) * noise_std
-    fi_obs_noisy = fi_obs + noise
-
-    with torch.no_grad():
-        if isinstance(agent, (FlowIntentAgent, ResidualPARLWrapper, DSRLWrapper, ResidualSACWrapper)):
-            act_norm = agent.sample(obs=fi_obs_noisy, use_ema=True, num_steps=num_steps)
-        else:
-            act_norm = agent.sample(obs=fi_obs_noisy, use_ema=True, num_steps=num_steps)
-
-    act_un = dataset.normalizer["action"].unnormalize(act_norm.cpu().numpy())
     remaining = n_future_steps
-    for a_i in range(min(act_steps, remaining)):
-        act = undo_action(act_un[0, s + a_i], config, dataset)
-        _, done, info = _step_inner(inner, act)
-        steps_run += 1
-        if done:
-            break
-    obs_buf = update_obs_buf(obs_buf, envs, config)
-    remaining -= act_steps
 
-    # ── Subsequent chunks: clean observations ─────────────────────────────────
     while not done and remaining > 0:
-        fi_obs_clean, _ = to_fi_obs(obs_buf, config, dataset, device)
+        fi_obs, _ = to_fi_obs(obs_buf, config, dataset, device)
         with torch.no_grad():
-            act_norm = agent.sample(obs=fi_obs_clean, use_ema=True, num_steps=num_steps)
+            act_norm = agent.sample(obs=fi_obs, use_ema=True, num_steps=num_steps)
         act_un = dataset.normalizer["action"].unnormalize(act_norm.cpu().numpy())
         for a_i in range(min(act_steps, remaining)):
             act = undo_action(act_un[0, s + a_i], config, dataset)
@@ -248,24 +252,32 @@ def run_noisy_rollout(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: noisy re-rollout per saved state
+# Phase 2: perturbed re-rollout per saved state
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_critical_states(ref_states, envs, agent, config, dataset, device, args):
-    """For each saved state, run n_noisy noisy re-rollouts and record outcomes."""
+    """For each saved state, run n_noisy perturbed re-rollouts and record outcomes."""
     results = []
     n_states = len(ref_states)
-    print(f"Phase 2: {n_states} states × {args.n_noisy} noisy rollouts each ...\n")
+    rng = np.random.default_rng(args.seed + 1)
+
+    print(f"Phase 2: {n_states} states × {args.n_noisy} perturbed rollouts each ...\n")
+    print(f"  Perturbation: joint-angle noise std={args.noise_std} rad on first {args.n_arm_joints} joints\n")
 
     for i, state in enumerate(ref_states):
         outcomes = []
-        # Give the policy the full remaining horizon to recover
         remaining_steps = config.task.max_episode_steps - state["timestep"]
+
         for k in range(args.n_noisy):
-            obs_buf = restore_env_obs(envs, state["sim_state"], config)
-            result = run_noisy_rollout(
+            # 1. Perturb physical sim state (joint angles only)
+            noised_sim_state = perturb_sim_state(
+                state["sim_state"], args.noise_std, args.n_arm_joints, rng=rng
+            )
+            # 2. Restore env to perturbed physical state; get clean obs from it
+            obs_buf = restore_env_obs(envs, noised_sim_state, config)
+            # 3. Roll out with clean policy observations
+            result = run_clean_rollout(
                 envs, obs_buf, agent, config, dataset, device,
-                noise_std=args.noise_std,
                 n_future_steps=remaining_steps,
             )
             outcomes.append(result["success"])
@@ -320,7 +332,6 @@ def analyze_and_plot(data, out_dir, label="policy"):
         s=20, alpha=0.6, edgecolors="none",
     )
     plt.colorbar(sc, ax=ax, label="Recovery rate")
-    # rolling mean
     if len(timesteps) > 10:
         sort_idx = np.argsort(timesteps)
         ts_s = timesteps[sort_idx]
@@ -329,10 +340,10 @@ def analyze_and_plot(data, out_dir, label="policy"):
         rm = np.convolve(rv_s, np.ones(window) / window, mode="valid")
         ax.plot(ts_s[window // 2: window // 2 + len(rm)], rm, "k-", lw=2, label=f"Rolling mean (w={window})")
         ax.legend(fontsize=9)
-    ax.axhline(0.5, color="gray", ls="--", lw=1, label="50% threshold")
+    ax.axhline(0.5, color="gray", ls="--", lw=1)
     ax.set_xlabel("Episode timestep")
-    ax.set_ylabel("Recovery rate after noise injection")
-    ax.set_title(f"{label}  |  noise_std={noise_std}  n_noisy={n_noisy}")
+    ax.set_ylabel("Recovery rate after joint-angle noise")
+    ax.set_title(f"{label}  |  noise_std={noise_std} rad  n_noisy={n_noisy}")
     ax.set_ylim(-0.05, 1.05)
     fig.tight_layout()
     fig.savefig(out_dir / "recovery_vs_timestep.png", dpi=150)
@@ -354,7 +365,7 @@ def analyze_and_plot(data, out_dir, label="policy"):
             plt.colorbar(sc, ax=ax, label="Recovery rate")
             ax.set_xlabel(xl)
             ax.set_ylabel(yl)
-        fig.suptitle(f"{label}  —  EEF position vs recovery rate  (noise_std={noise_std})", fontsize=11)
+        fig.suptitle(f"{label}  —  EEF position vs recovery rate  (noise_std={noise_std} rad)", fontsize=11)
         fig.tight_layout()
         fig.savefig(out_dir / "eef_recovery_scatter.png", dpi=150)
         plt.close(fig)
@@ -367,7 +378,7 @@ def analyze_and_plot(data, out_dir, label="policy"):
     ax.set_ylabel("Count")
     n_crit = is_critical.sum()
     ax.set_title(
-        f"{label}  |  noise_std={noise_std}\n"
+        f"{label}  |  noise_std={noise_std} rad\n"
         f"critical: {n_crit}/{len(states)} ({100*n_crit/len(states):.0f}%)"
     )
     ax.legend()
@@ -377,10 +388,8 @@ def analyze_and_plot(data, out_dir, label="policy"):
 
     # ── 4. Mean recovery by timestep bin ─────────────────────────────────────
     if len(timesteps) > 10:
-        bins = np.arange(0, timesteps.max() + 16, 16)  # 16-step bins (2 chunks)
-        bin_means = []
-        bin_stds = []
-        bin_centers = []
+        bins = np.arange(0, timesteps.max() + 16, 16)
+        bin_means, bin_stds, bin_centers = [], [], []
         for lo, hi in zip(bins[:-1], bins[1:]):
             mask = (timesteps >= lo) & (timesteps < hi)
             if mask.sum() > 0:
@@ -397,7 +406,7 @@ def analyze_and_plot(data, out_dir, label="policy"):
         ax.axhline(0.5, color="red", ls="--", lw=1, label="50% threshold")
         ax.set_xlabel("Episode timestep (binned)")
         ax.set_ylabel("Mean recovery rate")
-        ax.set_title(f"{label}  —  Recovery by episode phase  (noise_std={noise_std})")
+        ax.set_title(f"{label}  —  Recovery by episode phase  (noise_std={noise_std} rad)")
         ax.set_ylim(0, 1.1)
         ax.legend()
         fig.tight_layout()
@@ -408,7 +417,7 @@ def analyze_and_plot(data, out_dir, label="policy"):
     n_crit = is_critical.sum()
     n_red = (~is_critical).sum()
     print("\n" + "=" * 60)
-    print(f"SUMMARY  |  {label}  |  noise_std={noise_std}  n_noisy={n_noisy}")
+    print(f"SUMMARY  |  {label}  |  noise_std={noise_std} rad  n_noisy={n_noisy}")
     print("=" * 60)
     print(f"Total states evaluated : {len(states)}")
     print(f"Critical (recovery<50%): {n_crit} ({100*n_crit/len(states):.1f}%)")
@@ -416,7 +425,6 @@ def analyze_and_plot(data, out_dir, label="policy"):
     print(f"Mean recovery rate      : {recovery.mean():.3f} ± {recovery.std():.3f}")
     print(f"Timestep range          : [{timesteps.min()}, {timesteps.max()}]")
 
-    # Top 5 critical states
     crit_idx = np.argsort(recovery)[:5]
     print("\nTop 5 most critical states (lowest recovery):")
     for idx in crit_idx:
@@ -435,7 +443,7 @@ def analyze_and_plot(data, out_dir, label="policy"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Identify critical vs redundant states via observation noise injection.",
+        description="Identify critical vs redundant states via physical state perturbation.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -453,16 +461,18 @@ def main():
     )
     parser.add_argument(
         "--n-noisy", type=int, default=10,
-        help="Noisy re-rollouts per saved state (default: 10)",
+        help="Perturbed re-rollouts per saved state (default: 10)",
     )
     parser.add_argument(
-        "--noise-std", type=float, default=0.1,
-        help="Gaussian noise std in normalized obs space (default: 0.1). "
-             "Typical: 0.05=subtle, 0.1=moderate, 0.3=strong",
+        "--noise-std", type=float, default=0.05,
+        help=(
+            "Gaussian noise std on robot arm joint angles, in radians (default: 0.05). "
+            "Guide: 0.02=~1deg, 0.05=~3deg, 0.10=~6deg, 0.20=~11deg"
+        ),
     )
     parser.add_argument(
-        "--n-future-steps", type=int, default=100,
-        help="Steps to run forward per noisy re-rollout (default: 100)",
+        "--n-arm-joints", type=int, default=7,
+        help="Number of arm joints to perturb (default: 7 for Panda)",
     )
     parser.add_argument(
         "--subsample-every", type=int, default=1,
@@ -471,14 +481,22 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", required=True, help="Output .pkl path")
     parser.add_argument("--seed", type=int, default=42)
-    # Analysis-only mode
+    parser.add_argument(
+        "--agent-type", default=None,
+        choices=["residual_sac", "dsrl", "plain_dsrl", "residual_parl"],
+        help="RL agent type. Required when --run points to an RL checkpoint.",
+    )
+    parser.add_argument(
+        "--flow-intent-ckpt", default=None,
+        help="Path to the base FlowIntentAgent checkpoint. Required for RL agent types.",
+    )
     parser.add_argument(
         "--analyze-only", action="store_true",
         help="Skip data collection; load --out and generate figures only",
     )
     parser.add_argument(
         "--out-dir", default=None,
-        help="Directory for output figures (default: <out>.analysis/)",
+        help="Directory for output figures (default: <out_stem>_analysis/)",
     )
     args = parser.parse_args()
 
@@ -500,7 +518,7 @@ def main():
     label, ckpt_path, overrides = parse_run_spec(args.run)
     overrides_full = overrides + [
         f"optimization.device={args.device}",
-        "task.num_envs=1",          # one env for sequential restore
+        "task.num_envs=1",
         f"optimization.seed={args.seed}",
     ]
 
@@ -510,16 +528,19 @@ def main():
     dataset = make_dataset(config)
     maybe_register_libero_pro_objects(config)
 
-    agent, _ = load_model(ckpt_path, config, dataset, args.device)
+    agent, _ = load_model(
+        ckpt_path, config, dataset, args.device,
+        flow_intent_ckpt=args.flow_intent_ckpt,
+        agent_type=args.agent_type,
+    )
     agent.eval()
     if isinstance(agent, TrainingAgent):
         agent = BaselineAgentAdapter(agent, config)
 
     print(f"\nModel  : {label}  |  ckpt: {ckpt_path}")
     print(f"Task   : {config.task.env_name} ({config.task.obs_type})")
-    print(f"Noise  : std={args.noise_std}  (normalized obs space)")
-    print(f"Params : n_rollouts={args.n_rollouts}  n_noisy={args.n_noisy}  "
-          f"n_future_steps={args.n_future_steps}")
+    print(f"Noise  : std={args.noise_std} rad on {args.n_arm_joints} arm joints (physical state)")
+    print(f"Params : n_rollouts={args.n_rollouts}  n_noisy={args.n_noisy}")
 
     # Phase 1
     ref_states = collect_reference_states(
@@ -542,14 +563,13 @@ def main():
         "label": label,
         "noise_std": args.noise_std,
         "n_noisy": args.n_noisy,
-        "n_future_steps": args.n_future_steps,
+        "n_arm_joints": args.n_arm_joints,
         "states": results,
     }
     with open(args.out, "wb") as f:
         pickle.dump(output, f)
     print(f"\nSaved to: {args.out}")
 
-    # Auto-analyze
     out_dir = args.out_dir or (Path(args.out).stem + "_analysis")
     analyze_and_plot(output, out_dir, label=label)
 
