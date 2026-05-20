@@ -1,0 +1,18 @@
+# @package task
+defaults:
+  - lift_mh_image
+  - _self_
+
+intent_conditioning: true
+intent_type: "slot"
+intent_dim: 64        # must match slot_dim
+intent_horizon: 8     # number of future frames fed to slot attention
+
+num_slots: 3
+slot_dim: 64
+slot_iters: 3
+slot_aux_loss_weight: 1.0
+slot_recon_loss_weight: 1.0
+slot_obj_state_dim: 10   # "object" key is 10D in lift-mh HDF5
+slot_image_key: "agentview_image"
+use_soft_selector: true

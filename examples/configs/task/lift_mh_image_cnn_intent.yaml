@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - lift_mh_image
+  - _self_
+
+intent_conditioning: true
+intent_type: "cnn_image"
+intent_dim: 64        # CNNIntentEncoder output dim
+intent_horizon: 8     # number of future frames fed to CNN encoder
+
+# slot_image_key is reused as the camera key for future frame extraction
+slot_image_key: "agentview_image"

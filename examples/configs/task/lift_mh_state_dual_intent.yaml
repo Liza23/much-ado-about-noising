@@ -13,3 +13,4 @@ intent_key_groups:
     sub_slice: [0, 3]
 intent_predictor: true
 intent_type: mean
+intent_horizon: 8
