@@ -118,6 +118,8 @@ def make_dataset(task_config, mode="train"):
                 act_steps=task_config.act_steps,
                 intent_horizon=_intent_horizon,
                 intent_type=_intent_type,
+                slot_image_key=getattr(task_config, "slot_image_key", "agentview_image"),
+                slot_obj_state_dim=getattr(task_config, "slot_obj_state_dim", 10),
             )
         else:
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
@@ -445,6 +447,8 @@ class RobomimicImageDataset(BaseDataset):
         act_steps: int = 8,
         intent_horizon: int | None = None,
         intent_type: str = "mean",
+        slot_image_key: str = "agentview_image",
+        slot_obj_state_dim: int = 10,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -460,6 +464,21 @@ class RobomimicImageDataset(BaseDataset):
             "action": shape_meta["action"],
             "obs": {k: v for k, v in shape_meta["obs"].items() if not v.get("synthetic", False)},
         }
+        # For slot intent, inject the object state key so it loads into the replay buffer.
+        # It is NOT in the YAML shape_meta (not exposed as obs), but present in the HDF5.
+        _slot_obj_state_key = "object"
+        if intent_type == "slot" and _slot_obj_state_key not in _shape_meta_real["obs"]:  # cnn_image does not need object state key
+            if slot_obj_state_dim == -1:
+                # Auto-infer from HDF5 so the YAML can use -1 as a sentinel.
+                import h5py as _h5py
+                with _h5py.File(dataset_dir, "r") as _f:
+                    _demo = next(iter(_f["data"].keys()))
+                    slot_obj_state_dim = int(_f["data"][_demo]["obs"][_slot_obj_state_key].shape[-1])
+                logger.info(f"[Dataset] Auto-inferred slot_obj_state_dim={slot_obj_state_dim} from HDF5")
+            _shape_meta_real["obs"][_slot_obj_state_key] = {
+                "shape": [slot_obj_state_dim],
+                "type": "low_dim",
+            }
         self.replay_buffer = _convert_robomimic_to_replay(
             store=zarr.storage.MemoryStore(),
             shape_meta=_shape_meta_real,
@@ -491,12 +510,19 @@ class RobomimicImageDataset(BaseDataset):
         key_first_k = {}
         if n_obs_steps is not None:
             # only take first k obs from images.
-            # When intent_conditioning is enabled, exclude eef keys from the
-            # limit so that __getitem__ can access the full-horizon future
-            # frames needed for intent extraction (indices [obs_steps:obs_steps+intent_horizon]).
-            _intent_keys = {"robot0_eef_pos", "robot0_eef_quat"} if intent_conditioning else set()
+            # Keys in _full_horizon_keys are excluded from the limit so that
+            # __getitem__ can access full-horizon future frames for intent extraction.
+            _full_horizon_keys: set[str] = set()
+            if intent_conditioning:
+                _full_horizon_keys.update({"robot0_eef_pos", "robot0_eef_quat"})
+            if intent_type in ("slot", "cnn_image"):
+                # Both slot and cnn_image need future image frames for intent extraction.
+                _full_horizon_keys.add(slot_image_key)
+            if intent_type == "slot":
+                # Object state also needs full horizon for slot aux loss supervision
+                _full_horizon_keys.add(_slot_obj_state_key)
             for key in rgb_keys + lowdim_keys:
-                if key not in _intent_keys:
+                if key not in _full_horizon_keys:
                     key_first_k[key] = n_obs_steps
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
@@ -545,6 +571,18 @@ class RobomimicImageDataset(BaseDataset):
                 f"intent_horizon={self.intent_horizon}, intent_type={self.intent_type}"
             )
 
+        # Slot attention attributes (only meaningful when intent_type == "slot")
+        self.slot_image_key = slot_image_key
+        self.slot_obj_state_key = "object"
+        self.slot_obj_state_dim = slot_obj_state_dim
+        self.slot_obj_normalizer = None
+        if intent_type == "slot":
+            self.slot_obj_normalizer = MinMaxNormalizer(
+                self.replay_buffer[self.slot_obj_state_key][:]
+            )
+        else:
+            self.slot_obj_normalizer = None
+
     def get_normalizer(self):
         normalizer = defaultdict(dict)
         for key in self.lowdim_keys:
@@ -568,6 +606,13 @@ class RobomimicImageDataset(BaseDataset):
         # Needed for future-frame intent extraction when intent_conditioning=True.
         _raw_eef_pos_full = sample["robot0_eef_pos"].copy() if self.intent_conditioning else None
         _raw_eef_quat_full = sample["robot0_eef_quat"].copy() if self.intent_conditioning else None
+        # Save raw slot/cnn_image data (full horizon) before deletion.
+        _raw_slot_images_full = (
+            sample[self.slot_image_key].copy() if self.intent_type in ("slot", "cnn_image") else None
+        )
+        _raw_slot_obj_full = (
+            sample[self.slot_obj_state_key].copy() if self.intent_type == "slot" else None
+        )
 
         # obs
         # to save RAM, only return first n_obs_steps of OBS
@@ -614,11 +659,25 @@ class RobomimicImageDataset(BaseDataset):
         # Intent conditioning: extract future eef from the saved full-horizon arrays.
         # eef_pos/quat were deleted from sample above, so we use _raw_eef_pos/quat_full.
         # Shape contract:
+        #   "slot":         batch["intent_frames"] (k,C,H,W) + batch["object_states"] (k,10)
         #   "encoded_mean": (N, 7) — per-step seq; IntentEncoder+pool applied in training loop
         #   "final":        (7,)   — eef at t+N only
         #   "mean":         (7,)   — arithmetic mean of N future steps
         if self.intent_conditioning:
-            if self.intent_type == "cv_proxy":
+            if self.intent_type in ("slot", "cnn_image"):
+                # Future frames: indices [obs_steps : obs_steps+intent_horizon]
+                future_start = self.obs_steps_int
+                future_end = self.obs_steps_int + self.intent_horizon
+                # Images: full-horizon array (horizon, H, W, C) → slice future frames → (k, C, H, W)
+                slot_imgs = _raw_slot_images_full[future_start:future_end]  # (k, H, W, C)
+                slot_imgs = np.moveaxis(slot_imgs, -1, 1).astype(np.float32) / 255.0  # (k, C, H, W)
+                torch_data["intent_frames"] = torch.tensor(slot_imgs)    # (k, C, H, W)
+                if self.intent_type == "slot":
+                    # Object states: (k, obj_state_dim) — normalize to [0, 1]
+                    slot_objs = _raw_slot_obj_full[future_start:future_end].astype(np.float32)  # (k, D)
+                    slot_objs = self.slot_obj_normalizer.normalize(slot_objs)
+                    torch_data["object_states"] = torch.tensor(slot_objs)    # (k, obj_state_dim)
+            elif self.intent_type == "cv_proxy":
                 # Constant-velocity proxy from obs history — no GT lookahead needed.
                 pos_now  = _raw_eef_pos_full[self.obs_steps_int - 1].astype(np.float32)
                 pos_prev = _raw_eef_pos_full[self.obs_steps_int - 2].astype(np.float32)
@@ -633,6 +692,7 @@ class RobomimicImageDataset(BaseDataset):
                 velocity = eef_now - eef_prev
                 half_h = (self.intent_horizon + 1) / 2.0
                 intent = (eef_now + half_h * velocity).astype(np.float32)
+                torch_data["intent"] = torch.tensor(intent)
             else:
                 future_start = self.obs_steps_int
                 future_end = self.obs_steps_int + self.intent_horizon
@@ -645,7 +705,7 @@ class RobomimicImageDataset(BaseDataset):
                     intent = future_eef[-1].astype(np.float32)
                 else:  # "mean"
                     intent = future_eef.mean(axis=0).astype(np.float32)
-            torch_data["intent"] = torch.tensor(intent)
+                torch_data["intent"] = torch.tensor(intent)
 
         return torch_data
 

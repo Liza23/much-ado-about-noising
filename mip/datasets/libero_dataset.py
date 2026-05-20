@@ -36,6 +36,8 @@ def make_dataset(task_config, mode="train"):
     intent_type = getattr(task_config, "intent_type", "mean")
     intent_keys = getattr(task_config, "intent_keys", ["ee_states"])
     image_obs_keys = list(getattr(task_config, "image_obs_keys", None) or [])
+    task_id_conditioning = getattr(task_config, "task_id_conditioning", False)
+    num_tasks = len(dataset_paths) if task_id_conditioning else 1
 
     if intent_conditioning:
         pad_after = max(task_config.act_steps, intent_horizon) - 1
@@ -58,6 +60,8 @@ def make_dataset(task_config, mode="train"):
         intent_horizon=intent_horizon,
         intent_type=intent_type,
         intent_keys=intent_keys,
+        task_id_conditioning=task_id_conditioning,
+        num_tasks=num_tasks,
     )
 
 
@@ -93,6 +97,8 @@ class LiberoDataset(BaseDataset):
         intent_horizon: int = 8,
         intent_type: str = "mean",
         intent_keys: list[str] | None = None,
+        task_id_conditioning: bool = False,
+        num_tasks: int = 1,
     ):
         super().__init__()
         self.obs_keys = obs_keys
@@ -103,14 +109,16 @@ class LiberoDataset(BaseDataset):
         self.intent_horizon = intent_horizon
         self.intent_type = intent_type
         self.intent_keys = intent_keys or ["ee_states"]
+        self.task_id_conditioning = task_id_conditioning
+        self.num_tasks = num_tasks
         self.lowdim_keys = ["state"]
         self._state_key_dims = {}
 
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
 
-        for path in dataset_paths:
+        for task_id, path in enumerate(dataset_paths):
             logger.info(f"Loading LIBERO dataset: {path}")
-            self._load_hdf5(path)
+            self._load_hdf5(path, task_id=task_id)
 
         logger.info(
             f"Loaded {self.replay_buffer.n_episodes} episodes, "
@@ -141,7 +149,7 @@ class LiberoDataset(BaseDataset):
 
         self.normalizer = self._get_normalizer()
 
-    def _load_hdf5(self, path: str):
+    def _load_hdf5(self, path: str, task_id: int = 0):
         with h5py.File(path, "r") as f:
             demos = sorted(f["data"].keys())
             for demo_key in tqdm(demos, desc=f"Loading {os.path.basename(path)}"):
@@ -157,6 +165,8 @@ class LiberoDataset(BaseDataset):
                 state = np.concatenate(obs_parts, axis=-1)
 
                 episode = {"state": state, "action": actions}
+                if self.task_id_conditioning:
+                    episode["task_id"] = np.full(len(actions), task_id, dtype=np.int64)
 
                 # Image observations: load as uint8 CHW (convert from HWC).
                 for img_key in self.image_obs_keys:
@@ -208,6 +218,9 @@ class LiberoDataset(BaseDataset):
                 data["intent"] = future_eef.astype(np.float32)  # (N, eef_dim)
             else:  # "mean"
                 data["intent"] = future_eef.mean(axis=0).astype(np.float32)  # (eef_dim,)
+
+        if self.task_id_conditioning:
+            data["task_id"] = np.array(int(sample["task_id"][0]), dtype=np.int64)
 
         return data
 

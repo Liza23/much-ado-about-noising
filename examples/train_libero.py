@@ -50,6 +50,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
         or getattr(config.network, "arch_variant", "flow_action")
     )
     intent_conditioning = getattr(config.task, "intent_conditioning", False)
+    task_id_conditioning = getattr(config.task, "task_id_conditioning", False)
     obs_type = getattr(config.task, "obs_type", "state")
 
     dataloader = torch.utils.data.DataLoader(
@@ -119,11 +120,19 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                 for k in batch["obs"]
             }
             batch_size = next(iter(obs_dict.values())).shape[0]
+            if task_id_conditioning and "task_id" in batch:
+                task_oh = F.one_hot(batch["task_id"].long(), num_classes=config.task.num_tasks).float()
+                task_oh = task_oh.unsqueeze(1).expand(-1, config.task.obs_steps, -1).to(config.optimization.device)
+                obs_dict["state"] = torch.cat([obs_dict["state"], task_oh], dim=-1)
             obs = TensorDict(obs_dict, batch_size=batch_size)
             base_obs = obs
         else:
             obs = batch["obs"]["state"].to(config.optimization.device)
             obs = obs[:, : config.task.obs_steps, :]
+            if task_id_conditioning and "task_id" in batch:
+                task_oh = F.one_hot(batch["task_id"].long(), num_classes=config.task.num_tasks).float()
+                task_oh = task_oh.unsqueeze(1).expand(-1, config.task.obs_steps, -1).to(config.optimization.device)
+                obs = torch.cat([obs, task_oh], dim=-1)
             base_obs = obs
 
         # Intent conditioning (Config B only — Config A passes intent via agent.update)
@@ -334,10 +343,18 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
             if intent_encoder is not None:
                 intent_encoder.train()
 
+            early_stop_sr = getattr(config.optimization, "early_stop_sr", None)
+            if early_stop_sr is not None and primary_key in metrics:
+                if metrics[primary_key] >= early_stop_sr:
+                    loguru.logger.info(
+                        f"Early stop: {primary_key}={metrics[primary_key]:.3f} >= {early_stop_sr}. Done."
+                    )
+                    break
+
 
 def _run_eval_episodes(config, eval_envs, dataset, agent, num_steps,
                        intent_predictor, arch_variant, intent_conditioning,
-                       obs_type, image_obs_keys):
+                       obs_type, image_obs_keys, task_idx: int = 0):
     """Run eval episodes on already-constructed eval_envs. Returns (rewards, steps, successes)."""
     episode_rewards = []
     episode_steps = []
@@ -360,6 +377,14 @@ def _run_eval_episodes(config, eval_envs, dataset, agent, num_steps,
                         obs[img_key].astype(np.float32),
                         device=config.optimization.device, dtype=torch.float32,
                     )
+                task_id_conditioning = getattr(config.task, "task_id_conditioning", False)
+                if task_id_conditioning:
+                    task_oh = torch.zeros(
+                        config.task.num_envs, config.task.obs_steps, config.task.num_tasks,
+                        device=config.optimization.device,
+                    )
+                    task_oh[:, :, task_idx] = 1.0
+                    obs_dict["state"] = torch.cat([obs_dict["state"], task_oh], dim=-1)
                 obs_tensor = TensorDict(obs_dict, batch_size=config.task.num_envs)
                 if intent_conditioning and arch_variant != "flow_intent":
                     if intent_predictor is not None:
@@ -385,6 +410,14 @@ def _run_eval_episodes(config, eval_envs, dataset, agent, num_steps,
                 obs_tensor = torch.tensor(
                     obs, device=config.optimization.device, dtype=torch.float32
                 )
+                task_id_conditioning = getattr(config.task, "task_id_conditioning", False)
+                if task_id_conditioning:
+                    task_oh = torch.zeros(
+                        config.task.num_envs, config.task.obs_steps, config.task.num_tasks,
+                        device=config.optimization.device,
+                    )
+                    task_oh[:, :, task_idx] = 1.0
+                    obs_tensor = torch.cat([obs_tensor, task_oh], dim=-1)
                 if intent_conditioning and arch_variant != "flow_intent":
                     if intent_predictor is not None:
                         with torch.no_grad():
@@ -466,7 +499,7 @@ def evaluate(config: Config, envs, dataset, agent, logger, num_steps: int = 1,
         # Multi-task eval: run episodes on each task, average success across tasks.
         all_rewards, all_steps, all_success = [], [], []
         per_task_success = {}
-        for bddl_file in bddl_files:
+        for task_idx, bddl_file in enumerate(bddl_files):
             task_name = os.path.splitext(os.path.basename(bddl_file))[0]
             config.task.bddl_file = bddl_file
             eval_envs = make_vec_env(
@@ -476,7 +509,7 @@ def evaluate(config: Config, envs, dataset, agent, logger, num_steps: int = 1,
                 r, s, succ = _run_eval_episodes(
                     config, eval_envs, dataset, agent, num_steps,
                     intent_predictor, arch_variant, intent_conditioning,
-                    obs_type, image_obs_keys,
+                    obs_type, image_obs_keys, task_idx=task_idx,
                 )
             finally:
                 eval_envs.close()
@@ -540,6 +573,7 @@ def main(config):
         or getattr(config.network, "arch_variant", "flow_action")
     )
     intent_conditioning = getattr(config.task, "intent_conditioning", False)
+    task_id_conditioning = getattr(config.task, "task_id_conditioning", False)
 
     obs_type = getattr(config.task, "obs_type", "state")
     config.task.save_video = config.log.save_video
@@ -574,6 +608,15 @@ def main(config):
                 f"Intent conditioning [Config B image]: shape_meta state_dim "
                 f"{base_obs_dim} -> {_new_state_dim}"
             )
+        if task_id_conditioning:
+            dataset_paths = list(getattr(config.task, "dataset_paths", None) or [config.task.dataset_path])
+            config.task.num_tasks = len(dataset_paths)
+            _cur_state_dim = config.task.shape_meta["obs"]["state"]["shape"][0]
+            config.task.shape_meta["obs"]["state"]["shape"] = [_cur_state_dim + config.task.num_tasks]
+            loguru.logger.info(
+                f"Task ID conditioning [image]: shape_meta state_dim "
+                f"{_cur_state_dim} -> {_cur_state_dim + config.task.num_tasks} (num_tasks={config.task.num_tasks})"
+            )
     else:
         config.task.obs_dim = obs.shape[-1]
         base_obs_dim = config.task.obs_dim
@@ -588,6 +631,15 @@ def main(config):
             else config.task.intent_dim
         )
         config.task.obs_dim = base_obs_dim + _cond_dim
+
+    # Task ID conditioning: bump obs_dim (state mode only; image mode uses shape_meta)
+    if task_id_conditioning and obs_type == "state":
+        dataset_paths = list(getattr(config.task, "dataset_paths", None) or [config.task.dataset_path])
+        config.task.num_tasks = len(dataset_paths)
+        config.task.obs_dim = config.task.obs_dim + config.task.num_tasks
+        loguru.logger.info(
+            f"Task ID conditioning [state]: obs_dim -> {config.task.obs_dim} (num_tasks={config.task.num_tasks})"
+        )
         loguru.logger.info(
             f"Intent conditioning [Config B]: obs_dim {base_obs_dim} -> {config.task.obs_dim}"
         )

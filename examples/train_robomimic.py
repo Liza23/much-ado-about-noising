@@ -184,6 +184,25 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
         loguru.logger.info(f"Resuming training from step {start_step}")
         loguru.logger.info(f"Restored best metrics: {best_metrics}")
 
+    # Even when starting from scratch, protect any existing model_best.pt from
+    # being overwritten by the first eval (which is always "new best" when
+    # best_metrics is empty). Load just the training_state from model_best.pt
+    # to seed best_metrics — weights are NOT loaded, training still starts fresh.
+    if not best_metrics:
+        _best_pt = logger.model_dir / "model_best.pt"
+        if _best_pt.exists():
+            try:
+                _sd = torch.load(_best_pt, map_location="cpu")
+                _ts = _sd.get("training_state", {}) or {}
+                _saved_best = _ts.get("best_metrics", {})
+                if _saved_best:
+                    best_metrics = _saved_best
+                    loguru.logger.info(
+                        f"Seeded best_metrics from existing model_best.pt: {best_metrics}"
+                    )
+            except Exception as _e:
+                loguru.logger.warning(f"Could not read best_metrics from model_best.pt: {_e}")
+
         # Fast-forward the lr_scheduler to the correct step
         for _ in range(start_step):
             lr_scheduler.step()
@@ -361,8 +380,21 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                 if arch_variant.startswith("flow_intent"):
                     # Config A: agent handles both flow-intent and MLP-action updates.
                     # Use base_obs (no intent appended); GT intent passed explicitly.
-                    _intent_gt = batch["intent"].to(config.optimization.device)
-                    info = agent.update(act, base_obs, delta_t, intent_gt=_intent_gt)
+                    _intent_type = getattr(config.task, "intent_type", "mean")
+                    if _intent_type == "slot":
+                        _slot_batch = {
+                            "intent_frames": batch["intent_frames"].to(config.optimization.device),
+                            "object_states": batch["object_states"].to(config.optimization.device),
+                        }
+                        info = agent.update(act, base_obs, delta_t, slot_batch=_slot_batch)
+                    elif _intent_type == "cnn_image":
+                        _slot_batch = {
+                            "intent_frames": batch["intent_frames"].to(config.optimization.device),
+                        }
+                        info = agent.update(act, base_obs, delta_t, slot_batch=_slot_batch)
+                    else:
+                        _intent_gt = batch["intent"].to(config.optimization.device)
+                        info = agent.update(act, base_obs, delta_t, intent_gt=_intent_gt)
                     lr_scheduler.step()
                     action_lr_scheduler.step()
                 else:
