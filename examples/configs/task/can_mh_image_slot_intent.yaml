@@ -1,0 +1,19 @@
+# @package task
+defaults:
+  - can_mh_image
+  - _self_
+
+intent_conditioning: true
+intent_type: "slot"
+intent_dim: 64        # must match slot_dim
+intent_horizon: 8     # number of future frames fed to slot attention
+
+num_slots: 4
+slot_dim: 64
+slot_iters: 3
+slot_aux_loss_weight: 1.0
+slot_recon_loss_weight: 1.0
+slot_obj_state_dim: 14   # "object" key is 14D in can HDF5 (can pos+quat 7D + bin pos+quat 7D)
+slot_image_key: "agentview_image"
+use_soft_selector: true
+slot_use_layer2: true    # ResNet18 layer2: 128ch, ~11×11 — higher spatial res for slot decomposition

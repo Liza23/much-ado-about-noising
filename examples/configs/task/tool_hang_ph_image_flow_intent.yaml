@@ -1,0 +1,11 @@
+# @package task
+defaults:
+  - tool_hang_ph_image
+  - _self_
+
+intent_conditioning: true
+intent_type: mean
+intent_dim: 7
+intent_horizon: 8
+intent_predictor: false
+intent_training_mode: independent

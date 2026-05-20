@@ -1,0 +1,18 @@
+# @package task
+defaults:
+  - tool_hang_ph_image
+  - _self_
+
+intent_conditioning: true
+intent_type: "slot"
+intent_dim: 64        # must match slot_dim
+intent_horizon: 16    # longer horizon for 600-step task
+
+num_slots: 3
+slot_dim: 64
+slot_iters: 3
+slot_aux_loss_weight: 1.0
+slot_recon_loss_weight: 1.0
+slot_obj_state_dim: 44   # "object" key is 44D in tool-hang HDF5
+slot_image_key: "sideview_image"
+use_soft_selector: true
