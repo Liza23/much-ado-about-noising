@@ -144,6 +144,9 @@ class TaskConfig:
     render_size: int = 96  # Size of rendered images
     render_camera_name: str = "sideview"  # Camera name for robomimic rendering
     load_sim_states: bool = False  # Load MuJoCo sim states from HDF5 for rendering
+    # Task ID conditioning settings
+    task_id_conditioning: bool = False  # Concatenate one-hot task ID to obs (multi-task only)
+    num_tasks: int = 1  # Number of tasks; set automatically from len(dataset_paths)
     # Intent conditioning settings
     intent_conditioning: bool = False  # Whether to add intent (future eef pose) as extra conditioning
     intent_dim: int = 7  # Dimension of intent vector (3 pos + 4 quat = 7)
@@ -173,6 +176,16 @@ class TaskConfig:
     # instead of GT intent — closes the train/eval distribution gap. False = legacy behaviour.
     decoder_curriculum_steps: int = 0  # If > 0 and decoder_uses_sampled_intent=True, use GT intent
     # for the first N steps, then switch to ODE-sampled intent.
+    # Slot attention intent settings (intent_type="slot")
+    num_slots: int = 4
+    slot_dim: int = 64
+    slot_iters: int = 3
+    slot_aux_loss_weight: float = 1.0
+    slot_recon_loss_weight: float = 0.0  # weight for spatial broadcast reconstruction loss; 0 = disabled
+    slot_obj_state_dim: int = 10  # dimension of object low-dim state used for aux supervision
+    slot_image_key: str = "agentview_image"  # which image key to use for slot attention frames
+    use_soft_selector: bool = False  # if True, use learned soft selector over K slots instead of mean-pool
+    slot_use_layer2: bool = False  # if True, use ResNet18 layer2 (128ch, ~11×11) instead of layer3 (256ch, ~6×6)
 
 
 @dataclass

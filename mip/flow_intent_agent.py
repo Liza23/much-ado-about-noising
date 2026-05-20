@@ -58,6 +58,8 @@ from mip.interpolant import Interpolant
 from mip.losses import get_loss_fn
 from mip.mlp_action_decoder import MLPActionDecoder
 from mip.network_utils import get_encoder, get_network
+from mip.networks.cnn_intent_encoder import CNNIntentEncoder
+from mip.networks.slot_attention import SlotObjectEncoder
 from mip.torch_utils import at_least_ndim, report_parameters
 
 
@@ -97,6 +99,9 @@ class FlowIntentAgent:
         # and the flow model operates directly in the raw intent_dim (e.g. 7D) space.
         self._intent_type = getattr(config.task, "intent_type", "mean")
         self.intent_seq_encoder: IntentEncoder | None = None
+        self.slot_encoder: SlotObjectEncoder | None = None
+        self.cnn_intent_encoder: CNNIntentEncoder | None = None
+        self._slot_aux_loss_weight: float = 0.0
         if self._intent_type == "encoded_mean":
             _raw_intent_dim = config.task.intent_dim   # 7 (pos3+quat4)
             _intent_emb_dim = getattr(config.task, "intent_emb_dim", 64)
@@ -105,10 +110,49 @@ class FlowIntentAgent:
                 intent_emb_dim=_intent_emb_dim,
             ).to(device)
             self.intent_seq_encoder_ema = deepcopy(self.intent_seq_encoder).requires_grad_(False)
+            self.slot_encoder_ema = None
             effective_intent_dim = _intent_emb_dim
             report_parameters(self.intent_seq_encoder, model_name="Intent Seq Encoder [Config A, encoded_mean]")
+        elif self._intent_type == "slot":
+            # Slot attention object-centric intent encoder.
+            # intent_dim in config should equal slot_dim (e.g. 64).
+            _num_slots = getattr(config.task, "num_slots", 4)
+            _slot_dim = getattr(config.task, "slot_dim", 64)
+            _slot_iters = getattr(config.task, "slot_iters", 3)
+            _slot_obj_state_dim = getattr(config.task, "slot_obj_state_dim", 10)
+            _use_recon = getattr(config.task, "slot_recon_loss_weight", 0.0) > 0
+            _use_soft_selector = getattr(config.task, "use_soft_selector", False)
+            _use_layer2 = getattr(config.task, "slot_use_layer2", False)
+            self.slot_encoder = SlotObjectEncoder(
+                num_slots=_num_slots,
+                slot_dim=_slot_dim,
+                num_iters=_slot_iters,
+                obj_state_dim=_slot_obj_state_dim,
+                use_recon_decoder=_use_recon,
+                use_soft_selector=_use_soft_selector,
+                use_layer2=_use_layer2,
+            ).to(device)
+            self.slot_encoder_ema = deepcopy(self.slot_encoder).requires_grad_(False)
+            self._slot_aux_loss_weight = getattr(config.task, "slot_aux_loss_weight", 1.0)
+            self._slot_recon_loss_weight = getattr(config.task, "slot_recon_loss_weight", 0.0)
+            self.intent_seq_encoder_ema = None
+            self.cnn_intent_encoder_ema = None
+            effective_intent_dim = _slot_dim
+            report_parameters(self.slot_encoder, model_name="Slot Object Encoder [Config A, slot]")
+        elif self._intent_type == "cnn_image":
+            # Simple CNN intent encoder: ResNet18 → global avg pool → Linear → intent_dim.
+            # No slots, no aux loss — tests whether visual conditioning alone drives gains.
+            _intent_dim = getattr(config.task, "intent_dim", 64)
+            self.cnn_intent_encoder = CNNIntentEncoder(intent_dim=_intent_dim).to(device)
+            self.cnn_intent_encoder_ema = deepcopy(self.cnn_intent_encoder).requires_grad_(False)
+            self.intent_seq_encoder_ema = None
+            self.slot_encoder_ema = None
+            effective_intent_dim = _intent_dim
+            report_parameters(self.cnn_intent_encoder, model_name="CNN Intent Encoder [Config A, cnn_image]")
         else:
             self.intent_seq_encoder_ema = None
+            self.slot_encoder_ema = None
+            self.cnn_intent_encoder_ema = None
             effective_intent_dim = config.task.intent_dim  # e.g. 7
 
         # ── Flow intent model ─────────────────────────────────────────────
@@ -230,6 +274,8 @@ class FlowIntentAgent:
             list(self.encoder.parameters())
             + list(self.intent_flow_map.parameters())
             + (list(self.intent_seq_encoder.parameters()) if self.intent_seq_encoder is not None else [])
+            + (list(self.slot_encoder.parameters()) if self.slot_encoder is not None else [])
+            + (list(self.cnn_intent_encoder.parameters()) if self.cnn_intent_encoder is not None else [])
         )
         self.intent_optimizer = torch.optim.AdamW(
             intent_params,
@@ -264,10 +310,11 @@ class FlowIntentAgent:
 
     def update(
         self,
-        act: torch.Tensor,         # (B, horizon, act_dim)  — GT action
-        obs: torch.Tensor,         # (B, obs_steps, base_obs_dim) — NO intent appended
-        delta_t: torch.Tensor,     # (B,)
-        intent_gt: torch.Tensor,   # (B, intent_dim) — GT mean future eef
+        act: torch.Tensor,                     # (B, horizon, act_dim)  — GT action
+        obs: torch.Tensor,                     # (B, obs_steps, base_obs_dim) — NO intent appended
+        delta_t: torch.Tensor,                 # (B,)
+        intent_gt: torch.Tensor | None = None, # (B, intent_dim) — GT mean future eef; None for slot
+        slot_batch: dict | None = None,        # {"intent_frames": (B,k,C,H,W), "object_states": (B,k,D)}
     ) -> dict:
         """One training step for both models.
 
@@ -296,12 +343,33 @@ class FlowIntentAgent:
         # ── Step 1: flow intent loss ──────────────────────────────────────
         # Compute the intent target vector from the GT batch data.
         #
+        # "slot":         slot_batch contains future image frames → SlotObjectEncoder
+        #                 produces intent_vec (B, slot_dim) + aux_loss via obj regression.
         # "encoded_mean": intent_gt is (B, N, 7) — apply intent_seq_encoder per step
         #    then mean-pool → (B, intent_emb_dim).  Gradients flow through the encoder.
         # All other types: intent_gt is already the pre-computed vector (B, intent_dim).
         #
         # Reshape to (B, 1, D) to match the (B, Ta, act_dim) convention.
-        if self.intent_seq_encoder is not None:
+        slot_aux_loss = None
+        slot_recon_loss = None
+        if self.slot_encoder is not None:
+            assert slot_batch is not None, "slot_batch must be provided when intent_type == 'slot'"
+            intent_frames = slot_batch["intent_frames"]   # (B, k, C, H, W)
+            object_states = slot_batch["object_states"]   # (B, k, obj_state_dim)
+            use_recon = self._slot_recon_loss_weight > 0 and self.slot_encoder.recon_decoder is not None
+            if use_recon:
+                intent_vec, obj_pred, recon, recon_target = self.slot_encoder(
+                    intent_frames, return_recon=True
+                )
+                slot_recon_loss = nn.functional.mse_loss(recon, recon_target)
+            else:
+                intent_vec, obj_pred = self.slot_encoder(intent_frames)
+            slot_aux_loss = nn.functional.mse_loss(obj_pred, object_states)
+        elif self.cnn_intent_encoder is not None:
+            assert slot_batch is not None, "slot_batch must be provided when intent_type == 'cnn_image'"
+            intent_frames = slot_batch["intent_frames"]   # (B, k, C, H, W)
+            intent_vec = self.cnn_intent_encoder(intent_frames)  # (B, intent_dim)
+        elif self.intent_seq_encoder is not None:
             # intent_gt: (B, N, raw_intent_dim) → (B, N, intent_emb_dim) → (B, intent_emb_dim)
             assert intent_gt.dim() == 3, (
                 f"encoded_mean: expected intent_gt (B, N, raw_dim), got {intent_gt.shape}"
@@ -324,12 +392,20 @@ class FlowIntentAgent:
             delta_t,
         )
 
+        total_intent_loss = intent_loss
+        if slot_aux_loss is not None:
+            total_intent_loss = total_intent_loss + self._slot_aux_loss_weight * slot_aux_loss
+        if slot_recon_loss is not None:
+            total_intent_loss = total_intent_loss + self._slot_recon_loss_weight * slot_recon_loss
+
         self.intent_optimizer.zero_grad()
-        intent_loss.backward()
+        total_intent_loss.backward()
         if cfg.grad_clip_norm:
             intent_params = (
                 list(self.encoder.parameters())
                 + list(self.intent_flow_map.parameters())
+                + (list(self.slot_encoder.parameters()) if self.slot_encoder is not None else [])
+                + (list(self.cnn_intent_encoder.parameters()) if self.cnn_intent_encoder is not None else [])
             )
             nn.utils.clip_grad_norm_(intent_params, cfg.grad_clip_norm)
         self.intent_optimizer.step()
@@ -403,11 +479,16 @@ class FlowIntentAgent:
         if cfg.ema_rate < 1:
             self._ema_update()
 
-        return {
-            "loss": (intent_loss + action_loss).item(),
+        info = {
+            "loss": (total_intent_loss + action_loss).item(),
             "intent_loss": intent_loss.item(),
             "action_loss": action_loss.item(),
         }
+        if slot_aux_loss is not None:
+            info["slot_aux_loss"] = slot_aux_loss.item()
+        if slot_recon_loss is not None:
+            info["slot_recon_loss"] = slot_recon_loss.item()
+        return info
 
     def _ema_update(self):
         rate = self.config.optimization.ema_rate
@@ -421,6 +502,10 @@ class FlowIntentAgent:
             pairs.append((self.action_decoder, self.action_decoder_ema))
         if self.intent_seq_encoder is not None:
             pairs.append((self.intent_seq_encoder, self.intent_seq_encoder_ema))
+        if self.slot_encoder is not None:
+            pairs.append((self.slot_encoder, self.slot_encoder_ema))
+        if self.cnn_intent_encoder is not None:
+            pairs.append((self.cnn_intent_encoder, self.cnn_intent_encoder_ema))
         with torch.no_grad():
             for model, ema in pairs:
                 for p, p_ema in zip(model.parameters(), ema.parameters()):
@@ -762,6 +847,9 @@ class FlowIntentAgent:
         if self.intent_seq_encoder is not None:
             self.intent_seq_encoder.eval()
             self.intent_seq_encoder_ema.eval()
+        if self.cnn_intent_encoder is not None:
+            self.cnn_intent_encoder.eval()
+            self.cnn_intent_encoder_ema.eval()
 
     def train(self):
         """Switch all sub-models to train mode."""
@@ -778,6 +866,9 @@ class FlowIntentAgent:
         if self.intent_seq_encoder is not None:
             self.intent_seq_encoder.train()
             self.intent_seq_encoder_ema.train()
+        if self.cnn_intent_encoder is not None:
+            self.cnn_intent_encoder.train()
+            self.cnn_intent_encoder_ema.train()
 
     # ──────────────────────────────────────────────────────────────────────
     # Persistence
@@ -799,9 +890,15 @@ class FlowIntentAgent:
         else:
             checkpoint["action_decoder"] = self.action_decoder.state_dict()
             checkpoint["action_decoder_ema"] = self.action_decoder_ema.state_dict()
+        if self.slot_encoder is not None:
+            checkpoint["slot_encoder"] = self.slot_encoder.state_dict()
+            checkpoint["slot_encoder_ema"] = self.slot_encoder_ema.state_dict()
         if self.intent_seq_encoder is not None:
             checkpoint["intent_seq_encoder"] = self.intent_seq_encoder.state_dict()
             checkpoint["intent_seq_encoder_ema"] = self.intent_seq_encoder_ema.state_dict()
+        if self.cnn_intent_encoder is not None:
+            checkpoint["cnn_intent_encoder"] = self.cnn_intent_encoder.state_dict()
+            checkpoint["cnn_intent_encoder_ema"] = self.cnn_intent_encoder_ema.state_dict()
         if training_state is not None:
             checkpoint["training_state"] = training_state
         torch.save(checkpoint, path)
@@ -831,9 +928,15 @@ class FlowIntentAgent:
         else:
             self.action_decoder.load_state_dict(sd["action_decoder"])
             self.action_decoder_ema.load_state_dict(sd["action_decoder_ema"])
+        if self.slot_encoder is not None and "slot_encoder" in sd:
+            self.slot_encoder.load_state_dict(sd["slot_encoder"])
+            self.slot_encoder_ema.load_state_dict(sd["slot_encoder_ema"])
         if self.intent_seq_encoder is not None and "intent_seq_encoder" in sd:
             self.intent_seq_encoder.load_state_dict(sd["intent_seq_encoder"])
             self.intent_seq_encoder_ema.load_state_dict(sd["intent_seq_encoder_ema"])
+        if self.cnn_intent_encoder is not None and "cnn_intent_encoder" in sd:
+            self.cnn_intent_encoder.load_state_dict(sd["cnn_intent_encoder"])
+            self.cnn_intent_encoder_ema.load_state_dict(sd["cnn_intent_encoder_ema"])
 
         if load_optimizer:
             try:
