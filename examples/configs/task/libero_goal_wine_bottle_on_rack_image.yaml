@@ -1,0 +1,16 @@
+# @package task
+# LIBERO-Goal single-task: put_the_wine_bottle_on_the_rack — image observations
+defaults:
+  - libero_spatial_image
+  - _self_
+
+env_name: "libero_goal"
+env_type: "image"
+
+dataset_path: /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_wine_bottle_on_the_rack_demo.hdf5
+dataset_paths: null
+
+bddl_file: /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_wine_bottle_on_the_rack.bddl
+bddl_files: null
+
+num_envs: 5

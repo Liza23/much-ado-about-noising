@@ -1,0 +1,8 @@
+# @package task
+# LIBERO-Goal suite — image observations, flow-intent (all 10 tasks) with one-hot task ID conditioning
+defaults:
+  - libero_goal_suite_image_flow_intent
+  - _self_
+
+task_id_conditioning: true
+num_tasks: 10

@@ -1,0 +1,17 @@
+# @package task
+# LIBERO-Goal single-task: bowl_on_stove — image obs, flow-intent
+defaults:
+  - libero_goal_bowl_on_stove_image
+  - _self_
+
+arch_variant: flow_intent
+intent_conditioning: true
+intent_dim: 6
+intent_type: mean
+intent_predictor: false
+intent_horizon: 8
+intent_training_mode: independent
+intent_keys:
+  - ee_states
+decoder_uses_sampled_intent: false
+decoder_curriculum_steps: 0

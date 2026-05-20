@@ -1,0 +1,8 @@
+# @package task
+# LIBERO-Object suite — image observations, baseline (all 10 tasks) with one-hot task ID conditioning
+defaults:
+  - libero_object_suite_image
+  - _self_
+
+task_id_conditioning: true
+num_tasks: 10
